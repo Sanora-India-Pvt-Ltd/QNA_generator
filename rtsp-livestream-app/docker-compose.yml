@@ -1,0 +1,43 @@
+version: "3.9"
+
+services:
+  backend:
+    build: ./backend
+    container_name: rtsp-backend
+    restart: always
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=development
+      - MONGO_URI=mongodb://mongo:27017/rtsp_app
+    volumes:
+      - ./backend:/app
+      - ./backend/streams:/app/streams
+    depends_on:
+      - mongo
+
+  frontend:
+    build: ./frontend
+    container_name: rtsp-frontend
+    restart: always
+    ports:
+      - "5173:5173"
+    environment:
+      - CHOKIDAR_USEPOLLING=true
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    working_dir: /app
+    command: ["npm", "run", "dev"]
+
+  mongo:
+    image: mongo:6
+    container_name: rtsp-mongo
+    restart: always
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+volumes:
+  mongo_data:
