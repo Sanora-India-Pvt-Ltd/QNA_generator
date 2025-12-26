@@ -1,0 +1,12 @@
+youtube-transcript-api>=0.6.1
+openai>=1.0.0
+google-genai>=1.0.0
+requests>=2.31.0
+yt-dlp>=2023.12.30
+openai-whisper>=20231117
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+# Note: Ollama must be installed separately from https://ollama.com
+
+
