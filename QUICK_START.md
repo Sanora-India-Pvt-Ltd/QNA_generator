@@ -309,11 +309,34 @@ console.log(`Generated ${data.questions.length} questions`);
 export CLOUD_ENV=true  # Disables Whisper fallback (required on cloud)
 ```
 
+**For Fast Mode (30-second processing - DEFAULT):**
+```bash
+export FAST_MODE=true  # Enabled by default - skips Agent-03 enrichment for speed
+```
+
+**For Full Quality Mode (slower but more enriched):**
+```bash
+export FAST_MODE=false  # Enables Agent-03 web enrichment (adds 1-3 minutes)
+```
+
 **For Local Development:**
 ```bash
 # No environment variables needed
+# FAST_MODE=true by default (30-second processing)
 # Whisper fallback is enabled by default
 ```
+
+### Fast Mode vs Full Quality Mode
+
+| Feature | Fast Mode (Default) | Full Quality Mode |
+|---------|---------------------|------------------|
+| **Processing Time** | ~30 seconds | 2-5 minutes |
+| **Agent-03 Enrichment** | ❌ Disabled | ✅ Enabled |
+| **Whisper Model** | `tiny` (faster) | `base` (better quality) |
+| **Transcript Size** | 2000 chars | 3000 chars |
+| **Ollama Retries** | 3 retries | 10 retries |
+| **Timeout** | 90 seconds | 300 seconds |
+| **Best For** | Production, quick results | Research, maximum quality |
 
 ### Ollama Models
 

@@ -14,7 +14,7 @@ from app.schemas import (
     VideoURLRequest, CourseVideoRequest, CourseQuizResponse
 )
 from app.services.quiz_service import (
-    create_quiz, create_quiz_from_video_url, create_course_quiz
+    generate_quiz, create_quiz, create_quiz_from_video_url, create_course_quiz
 )
 
 app = FastAPI(
@@ -42,17 +42,21 @@ def health_check():
 
 
 @app.post("/generate-quiz", response_model=QuizResponse)
-def generate_quiz(payload: QuizRequest):
+def generate_quiz_api(payload: QuizRequest):
     """
-    Generate 20 unique MCQs from a YouTube video URL
+    Generate 20 unique MCQs from a video URL (YouTube or direct video URL)
+    
+    Automatically detects URL type and routes to appropriate handler:
+    - YouTube URLs → YouTube Transcript API (with Whisper fallback)
+    - Direct video URLs (S3, CDN, HTTPS) → Video download + Whisper transcription
     
     Pipeline:
-    1. Fetch transcript (YouTube API or Whisper fallback)
+    1. Detect URL type and fetch transcript
     2. Agent-03: Web knowledge enrichment
     3. Generate 20 unique MCQs using Ollama
     
     Args:
-        payload: QuizRequest containing youtube_url
+        payload: QuizRequest containing url (YouTube or direct video URL)
         
     Returns:
         QuizResponse with exactly 20 MCQ questions
@@ -61,8 +65,11 @@ def generate_quiz(payload: QuizRequest):
         HTTPException: If quiz generation fails
     """
     try:
-        result = create_quiz(str(payload.youtube_url))
+        result = generate_quiz(str(payload.url))
         return result
+    except ValueError as e:
+        # Handle unsupported URL type
+        raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         # Handle expected errors (e.g., wrong question count)
         raise HTTPException(status_code=500, detail=str(e))

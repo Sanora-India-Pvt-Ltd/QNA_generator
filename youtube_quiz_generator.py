@@ -36,6 +36,10 @@ from bs4 import BeautifulSoup
 # (Whisper requires yt-dlp which is blocked by YouTube on cloud VMs)
 IS_CLOUD_ENV = os.environ.get("CLOUD_ENV", "false").lower() == "true"
 
+# Set FAST_MODE=true to disable Agent-03 enrichment for faster processing (~30 seconds)
+# When enabled: Skips web search enrichment, uses faster models, reduces retries
+FAST_MODE = os.environ.get("FAST_MODE", "true").lower() == "true"  # Default: enabled for speed
+
 # ===============================
 # OLLAMA CONFIG (FAST + STABLE)
 # ===============================
@@ -81,8 +85,9 @@ if not OLLAMA_CMD:
     )
 
 OLLAMA_MODEL = "gemma2:2b"  # Fast model, good for MCQs. Alternatives: "llama3", "mistral"
-OLLAMA_ENRICHMENT_MODEL = "mistral:7b"  # Safe for 8GB RAM (replaced llama3:8b)
-MAX_TRANSCRIPT_CHARS = 3000   # Reduced for faster processing on cloud VMs
+OLLAMA_ENRICHMENT_MODEL = "gemma2:2b"  # Fast model for enrichment (faster than mistral:7b, avoids timeouts)
+MAX_TRANSCRIPT_CHARS = 2000 if FAST_MODE else 3000   # Reduced for faster processing in fast mode
+WHISPER_MODEL = "tiny" if FAST_MODE else "base"  # Faster model in fast mode
 
 # ===============================
 # AGENT-03: WEB SEARCH CONFIG
@@ -253,8 +258,10 @@ class VideoURLTranscriber:
     Transcribe videos from direct URLs (S3, CDN, HTTPS).
     Works with any HTTP/HTTPS video URL - no YouTube, no yt-dlp, no cookies.
     """
-    def __init__(self, model="base"):
+    def __init__(self, model=None):
         import whisper
+        if model is None:
+            model = WHISPER_MODEL  # Use global FAST_MODE setting
         self.model = whisper.load_model(model)
 
     def download_video(self, video_url: str) -> str:
@@ -269,7 +276,7 @@ class VideoURLTranscriber:
 
         try:
             # Download with streaming for large files
-            response = requests.get(video_url, stream=True, timeout=300)
+            response = requests.get(video_url, stream=True, timeout=120 if FAST_MODE else 300)
             response.raise_for_status()
             
             with open(video_path, "wb") as f:
@@ -312,7 +319,7 @@ class VideoURLTranscriber:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 check=True,
-                timeout=300
+                timeout=120 if FAST_MODE else 300
             )
             
             if not os.path.exists(audio_path):
@@ -402,7 +409,7 @@ Output JSON array only:"""
             text=True,
             encoding='utf-8',
             errors='replace',
-            timeout=120,
+            timeout=60,
             check=False
         )
         
@@ -565,7 +572,7 @@ Output JSON array only:"""
             text=True,
             encoding='utf-8',
             errors='replace',
-            timeout=120,
+            timeout=60,
             check=False
         )
         
@@ -713,7 +720,7 @@ Provide a concise, educational summary:"""
             text=True,
             encoding='utf-8',
             errors='replace',
-            timeout=180,
+            timeout=60,
             check=False
         )
         
@@ -863,8 +870,11 @@ def repair_json(json_str):
 # ===============================
 # OLLAMA MCQ GENERATOR (DIRECT BINARY)
 # ===============================
-def generate_mcqs_with_ollama(transcript, max_retries=10):
+def generate_mcqs_with_ollama(transcript, max_retries=None):
     """Generate MCQs using Ollama binary directly - ensures EXACTLY 20 questions (not less, not more)"""
+    if max_retries is None:
+        max_retries = 3 if FAST_MODE else 10  # Fewer retries in fast mode
+    
     all_questions = []
     TARGET_COUNT = 20  # EXACTLY 20 questions required
     
@@ -946,7 +956,7 @@ Generate EXACTLY 20 questions. Output JSON only:"""
                 text=True,
                 encoding='utf-8',
                 errors='replace',  # Replace invalid chars instead of failing
-                timeout=300,  # 5 minutes timeout
+                timeout=90 if FAST_MODE else 300,  # Faster timeout in fast mode
                 check=False  # Don't raise on non-zero exit
             )
             
@@ -1203,20 +1213,23 @@ def generate_quiz_from_url(youtube_url: str):
                 "Transcript unavailable. Whisper fallback is disabled on cloud servers. "
                 "Please use a video with available captions."
             )
-        transcript = WhisperAudioTranscriber().transcribe(youtube_url)
+        transcriber = WhisperAudioTranscriber(model=WHISPER_MODEL)
+        transcript = transcriber.transcribe(youtube_url)
     
     transcript = clean_transcript(transcript)
     
-    # Agent-03: Enrich knowledge with web search
-    enriched_knowledge = enrich_knowledge_with_web_search(transcript)
-    
-    # Merge transcript with enriched knowledge
-    if enriched_knowledge:
-        enriched_context = f"{transcript}\n\n--- ENRICHED KNOWLEDGE ---\n\n{enriched_knowledge}"
-    else:
+    # Agent-03: Enrich knowledge with web search (skipped in FAST_MODE)
+    if FAST_MODE:
+        # Skip enrichment for faster processing (~30 seconds)
         enriched_context = transcript
+    else:
+        enriched_knowledge = enrich_knowledge_with_web_search(transcript)
+        if enriched_knowledge:
+            enriched_context = f"{transcript}\n\n--- ENRICHED KNOWLEDGE ---\n\n{enriched_knowledge}"
+        else:
+            enriched_context = transcript
     
-    questions = generate_mcqs_with_ollama(enriched_context)
+    questions = generate_mcqs_with_ollama(enriched_context, max_retries=3 if FAST_MODE else 10)
     
     # Final validation: MUST have exactly 20 questions
     if len(questions) != 20:
@@ -1252,22 +1265,25 @@ def generate_quiz_from_video_url(video_url: str):
         Exception: For video download, transcription, or processing errors
     """
     # Step 1: Transcribe video from URL
-    transcript = VideoURLTranscriber().transcribe_from_url(video_url)
+    transcriber = VideoURLTranscriber(model=WHISPER_MODEL)
+    transcript = transcriber.transcribe_from_url(video_url)
     
     # Step 2: Clean transcript
     transcript = clean_transcript(transcript)
     
-    # Step 3: Agent-03: Enrich knowledge with web search
-    enriched_knowledge = enrich_knowledge_with_web_search(transcript)
-    
-    # Step 4: Merge context
-    if enriched_knowledge:
-        enriched_context = f"{transcript}\n\n--- ENRICHED KNOWLEDGE ---\n\n{enriched_knowledge}"
-    else:
+    # Step 3: Agent-03: Enrich knowledge with web search (skipped in FAST_MODE)
+    if FAST_MODE:
+        # Skip enrichment for faster processing (~30 seconds)
         enriched_context = transcript
+    else:
+        enriched_knowledge = enrich_knowledge_with_web_search(transcript)
+        if enriched_knowledge:
+            enriched_context = f"{transcript}\n\n--- ENRICHED KNOWLEDGE ---\n\n{enriched_knowledge}"
+        else:
+            enriched_context = transcript
     
-    # Step 5: Generate MCQs
-    questions = generate_mcqs_with_ollama(enriched_context)
+    # Step 4: Generate MCQs
+    questions = generate_mcqs_with_ollama(enriched_context, max_retries=3 if FAST_MODE else 10)
     
     # Step 6: Validate
     if len(questions) != 20:

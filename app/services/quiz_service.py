@@ -12,9 +12,62 @@ sys.path.insert(0, project_root)
 from youtube_quiz_generator import generate_quiz_from_url, generate_quiz_from_video_url
 
 
+def generate_quiz(url: str):
+    """
+    Generate quiz from URL - automatically routes based on URL type
+    
+    Supports:
+    - YouTube URLs (youtube.com, youtu.be)
+    - Direct video URLs (S3, CDN, HTTPS with .mp4, .mov, .mkv, .webm extensions)
+    
+    Args:
+        url: Video URL (YouTube or direct video URL)
+        
+    Returns:
+        dict: {"questions": [...]} with 20 MCQ dictionaries
+        
+    Raises:
+        ValueError: If URL type is unsupported
+        Exception: If quiz generation fails
+    """
+    url = url.strip()
+    
+    # 1️⃣ YouTube URLs
+    if "youtube.com" in url or "youtu.be" in url:
+        questions = generate_quiz_from_url(url)
+        return {"questions": questions}
+    
+    # 2️⃣ Direct video URLs (S3 / CDN / MP4)
+    if url.startswith("http") and (
+        url.endswith((".mp4", ".mov", ".mkv", ".webm")) or
+        ".mp4" in url or ".mov" in url or ".mkv" in url or ".webm" in url
+    ):
+        questions = generate_quiz_from_video_url(url)
+        return {"questions": questions}
+    
+    # 3️⃣ Generic HTTPS URLs (assume video if not YouTube)
+    if url.startswith("http"):
+        # Try as direct video URL (will fail gracefully if not a video)
+        try:
+            questions = generate_quiz_from_video_url(url)
+            return {"questions": questions}
+        except Exception:
+            raise ValueError(
+                f"Unsupported URL type: {url}\n"
+                "Supported formats:\n"
+                "  - YouTube URLs (youtube.com, youtu.be)\n"
+                "  - Direct video URLs (S3, CDN with .mp4, .mov, .mkv, .webm extensions)"
+            )
+    
+    raise ValueError(
+        f"Invalid URL format: {url}\n"
+        "URL must be a valid HTTP/HTTPS URL"
+    )
+
+
 def create_quiz(youtube_url: str):
     """
-    Generate quiz from YouTube URL
+    Generate quiz from YouTube URL (legacy function - kept for backward compatibility)
     
     Args:
         youtube_url: YouTube video URL (string)

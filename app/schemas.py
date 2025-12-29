@@ -6,8 +6,8 @@ from typing import Dict, List, Optional
 
 
 class QuizRequest(BaseModel):
-    """Request model for quiz generation from YouTube URL"""
-    youtube_url: AnyUrl
+    """Request model for quiz generation from YouTube URL or direct video URL (S3, CDN, HTTPS)"""
+    url: AnyUrl
 
 
 class VideoURLRequest(BaseModel):
