@@ -24,13 +24,62 @@ import sys
 import tempfile
 import subprocess
 import requests
+import platform
+import shutil
 from urllib.parse import urlparse, parse_qs
 from bs4 import BeautifulSoup
 
 # ===============================
+# ENVIRONMENT CONFIG
+# ===============================
+# Set CLOUD_ENV=true to disable Whisper fallback on cloud servers
+# (Whisper requires yt-dlp which is blocked by YouTube on cloud VMs)
+IS_CLOUD_ENV = os.environ.get("CLOUD_ENV", "false").lower() == "true"
+
+# ===============================
 # OLLAMA CONFIG (FAST + STABLE)
 # ===============================
-OLLAMA_CMD = "/usr/local/bin/ollama"  # Linux/Azure: absolute path (do not rely on PATH)
+# Auto-detect Ollama path (OS-aware)
+# First try PATH detection (most portable)
+OLLAMA_CMD = shutil.which("ollama")
+
+# If not in PATH, use OS-specific default paths
+if not OLLAMA_CMD:
+    if platform.system() == "Windows":
+        # Windows default installation path
+        windows_path = r"C:\Users\Hp\AppData\Local\Programs\Ollama\ollama.exe"
+        if os.path.exists(windows_path):
+            OLLAMA_CMD = windows_path
+        else:
+            # Try common Windows locations
+            alt_paths = [
+                os.path.expanduser(r"~\AppData\Local\Programs\Ollama\ollama.exe"),
+                r"C:\Program Files\Ollama\ollama.exe",
+            ]
+            for alt_path in alt_paths:
+                if os.path.exists(alt_path):
+                    OLLAMA_CMD = alt_path
+                    break
+    
+    if not OLLAMA_CMD:
+        # Linux/macOS default paths
+        linux_paths = [
+            "/usr/local/bin/ollama",
+            "/usr/bin/ollama",
+            os.path.expanduser("~/bin/ollama"),
+        ]
+        for linux_path in linux_paths:
+            if os.path.exists(linux_path):
+                OLLAMA_CMD = linux_path
+                break
+
+# Final check: raise error if Ollama not found
+if not OLLAMA_CMD:
+    raise RuntimeError(
+        "Ollama not found. Please install Ollama from https://ollama.com\n"
+        "Or ensure 'ollama' is in your PATH."
+    )
+
 OLLAMA_MODEL = "gemma2:2b"  # Fast model, good for MCQs. Alternatives: "llama3", "mistral"
 OLLAMA_ENRICHMENT_MODEL = "mistral:7b"  # Safe for 8GB RAM (replaced llama3:8b)
 MAX_TRANSCRIPT_CHARS = 3000   # Reduced for faster processing on cloud VMs
@@ -195,6 +244,131 @@ class WhisperAudioTranscriber:
                     os.remove(audio_path)
                 except Exception:
                     pass  # Ignore cleanup errors
+
+# ===============================
+# VIDEO URL TRANSCRIBER (S3/CDN/HTTPS)
+# ===============================
+class VideoURLTranscriber:
+    """
+    Transcribe videos from direct URLs (S3, CDN, HTTPS).
+    Works with any HTTP/HTTPS video URL - no YouTube, no yt-dlp, no cookies.
+    """
+    def __init__(self, model="base"):
+        import whisper
+        self.model = whisper.load_model(model)
+
+    def download_video(self, video_url: str) -> str:
+        """Download video from URL and return path to local file"""
+        temp_file = tempfile.NamedTemporaryFile(
+            suffix=".mp4",
+            prefix="video_",
+            delete=False
+        )
+        temp_file.close()
+        video_path = temp_file.name
+
+        try:
+            # Download with streaming for large files
+            response = requests.get(video_url, stream=True, timeout=300)
+            response.raise_for_status()
+            
+            with open(video_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
+                    if chunk:
+                        f.write(chunk)
+            
+            if not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
+                raise RuntimeError(f"Downloaded file is empty or missing: {video_path}")
+            
+            return video_path
+        except Exception as e:
+            # Clean up on error
+            if os.path.exists(video_path):
+                try:
+                    os.remove(video_path)
+                except:
+                    pass
+            raise RuntimeError(f"Failed to download video from URL: {str(e)}")
+
+    def extract_audio(self, video_path: str) -> str:
+        """Extract audio from video using FFmpeg"""
+        audio_path = video_path.replace(".mp4", ".mp3")
+        
+        # Try alternative extensions if .mp4 replacement doesn't work
+        if not audio_path.endswith(".mp3"):
+            audio_path = os.path.splitext(video_path)[0] + ".mp3"
+        
+        try:
+            # Use FFmpeg to extract audio
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y",  # -y: overwrite output file
+                    "-i", video_path,
+                    "-vn",  # No video
+                    "-acodec", "libmp3lame",  # MP3 codec
+                    "-ab", "192k",  # Audio bitrate
+                    audio_path
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=True,
+                timeout=300
+            )
+            
+            if not os.path.exists(audio_path):
+                raise RuntimeError(f"Audio extraction failed: {audio_path}")
+            
+            return audio_path
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"FFmpeg failed: {e.stderr.decode('utf-8', errors='ignore')}")
+        except FileNotFoundError:
+            raise RuntimeError(
+                "FFmpeg not found. Please install FFmpeg:\n"
+                "  Windows: Download from https://ffmpeg.org\n"
+                "  Linux: sudo apt-get install ffmpeg\n"
+                "  macOS: brew install ffmpeg"
+            )
+
+    def transcribe_from_url(self, video_url: str) -> str:
+        """
+        Transcribe video from URL (S3, CDN, HTTPS).
+        
+        Pipeline:
+        1. Download video from URL
+        2. Extract audio using FFmpeg
+        3. Transcribe with Whisper
+        4. Clean up temp files
+        
+        Args:
+            video_url: HTTP/HTTPS URL to video file (e.g., S3 URL)
+            
+        Returns:
+            Transcribed text string
+        """
+        video_path = None
+        audio_path = None
+        
+        try:
+            # Step 1: Download video
+            video_path = self.download_video(video_url)
+            
+            # Step 2: Extract audio
+            audio_path = self.extract_audio(video_path)
+            
+            # Step 3: Transcribe
+            result = self.model.transcribe(audio_path)
+            return result["text"]
+            
+        except Exception as e:
+            raise RuntimeError(f"Video transcription failed: {str(e)}")
+        finally:
+            # Always clean up temp files
+            for file_path in [audio_path, video_path]:
+                if file_path and os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                    except Exception:
+                        pass  # Ignore cleanup errors
 
 # ===============================
 # CLEAN + SHRINK TRANSCRIPT
@@ -950,7 +1124,12 @@ def main():
     try:
         print("Fetching transcript...")
         transcript = fetcher.fetch(url)
-    except Exception:
+    except Exception as e:
+        if IS_CLOUD_ENV:
+            raise RuntimeError(
+                "Transcript unavailable. Whisper fallback is disabled on cloud servers. "
+                "Please use a video with available captions."
+            )
         print("⚠ Transcript unavailable — using Whisper (slow)")
         transcript = WhisperAudioTranscriber().transcribe(url)
 
@@ -1018,7 +1197,12 @@ def generate_quiz_from_url(youtube_url: str):
     
     try:
         transcript = fetcher.fetch(youtube_url)
-    except Exception:
+    except Exception as e:
+        if IS_CLOUD_ENV:
+            raise RuntimeError(
+                "Transcript unavailable. Whisper fallback is disabled on cloud servers. "
+                "Please use a video with available captions."
+            )
         transcript = WhisperAudioTranscriber().transcribe(youtube_url)
     
     transcript = clean_transcript(transcript)
@@ -1041,6 +1225,58 @@ def generate_quiz_from_url(youtube_url: str):
         )
     
     return questions
+
+
+def generate_quiz_from_video_url(video_url: str):
+    """
+    Generate 20 unique MCQs from a direct video URL (S3, CDN, HTTPS).
+    
+    This function works with any HTTP/HTTPS video URL - no YouTube, no yt-dlp, no cookies.
+    Perfect for course videos stored on S3, CDN, or any web server.
+    
+    Pipeline:
+    1. Download video from URL
+    2. Extract audio using FFmpeg
+    3. Transcribe with Whisper
+    4. Agent-03: Web knowledge enrichment
+    5. Generate 20 unique MCQs using Ollama
+    
+    Args:
+        video_url: HTTP/HTTPS URL to video file (e.g., S3 URL)
+        
+    Returns:
+        List of 20 MCQ dictionaries with keys: question, options, correct_answer, explanation
+        
+    Raises:
+        RuntimeError: If exactly 20 questions cannot be generated
+        Exception: For video download, transcription, or processing errors
+    """
+    # Step 1: Transcribe video from URL
+    transcript = VideoURLTranscriber().transcribe_from_url(video_url)
+    
+    # Step 2: Clean transcript
+    transcript = clean_transcript(transcript)
+    
+    # Step 3: Agent-03: Enrich knowledge with web search
+    enriched_knowledge = enrich_knowledge_with_web_search(transcript)
+    
+    # Step 4: Merge context
+    if enriched_knowledge:
+        enriched_context = f"{transcript}\n\n--- ENRICHED KNOWLEDGE ---\n\n{enriched_knowledge}"
+    else:
+        enriched_context = transcript
+    
+    # Step 5: Generate MCQs
+    questions = generate_mcqs_with_ollama(enriched_context)
+    
+    # Step 6: Validate
+    if len(questions) != 20:
+        raise RuntimeError(
+            f"Expected exactly 20 questions, but got {len(questions)}"
+        )
+    
+    return questions
+
 
 # ===============================
 if __name__ == "__main__":
