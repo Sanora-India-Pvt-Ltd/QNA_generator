@@ -88,3 +88,4 @@ If you get a response, Ollama API is working! ✅
 Your code now uses the correct Ollama API endpoint. Run your script and it should work! 🎉
 
 
+

@@ -1,0 +1,8 @@
+PS C:\Users\Hp\lll\youtube url> # Windows
+>> start_api.bat
+>> 
+>> # Or manually
+>> uvicorn app.main:app --reload
+
+
+#README

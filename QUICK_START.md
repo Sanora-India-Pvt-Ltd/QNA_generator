@@ -108,3 +108,4 @@ pip install openai-whisper torch torchvision torchaudio
 The script now uses **offline Whisper** - no more API key issues for transcription!
 
 
+

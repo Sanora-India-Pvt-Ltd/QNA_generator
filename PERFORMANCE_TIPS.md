@@ -64,3 +64,4 @@ The code tries YouTube transcripts first (fast) before Whisper (slow).
 - Use larger Ollama models for better quality (slower)
 - Cache transcripts to avoid re-processing
 
+

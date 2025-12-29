@@ -5,8 +5,16 @@ Pipeline:
 YouTube URL
 → YouTube Transcript API (auto-translate if needed)
 → Whisper (ONLY if captions unavailable)
+→ Agent-03: Web Knowledge Enrichment
+   ├─ Topic Extraction (Ollama llama3:8b)
+   ├─ Topic Validation (remove generic words)
+   ├─ Query Generation (Ollama llama3:8b)
+   ├─ Controlled Web Search (approved domains only)
+   ├─ Content Fetching & Cleaning
+   └─ Knowledge Synthesis (Ollama llama3:8b)
+→ Merged Context (Transcript + Enriched Knowledge)
 → Ollama Binary (direct execution, no HTTP)
-→ 20 UNIQUE MCQs (valid JSON)
+→ 20 UNIQUE MCQs (valid JSON) 
 """
 
 import os
@@ -15,14 +23,45 @@ import json
 import sys
 import tempfile
 import subprocess
+import requests
 from urllib.parse import urlparse, parse_qs
+from bs4 import BeautifulSoup
 
 # ===============================
 # OLLAMA CONFIG (FAST + STABLE)
 # ===============================
 OLLAMA_EXE = r"C:\Users\Hp\AppData\Local\Programs\Ollama\ollama.exe"
 OLLAMA_MODEL = "gemma2:2b"  # Fast model, good for MCQs. Alternatives: "llama3", "mistral"
+OLLAMA_ENRICHMENT_MODEL = "llama3:8b"  # Better model for knowledge enrichment tasks
 MAX_TRANSCRIPT_CHARS = 4000   # speed-critical
+
+# ===============================
+# AGENT-03: WEB SEARCH CONFIG
+# ===============================
+APPROVED_DOMAINS = [
+    "wikipedia.org",
+    "who.int",
+    "cdc.gov",
+    "nih.gov",
+    "radiologyinfo.org",
+    "britannica.com",
+    "edu",  # Educational institutions
+    "gov",  # Government sites
+    "org"   # Non-profit organizations (trusted ones)
+]
+
+GENERIC_WORDS = {
+    "machine", "device", "system", "technology",
+    "equipment", "tool", "process", "method",
+    "thing", "stuff", "item", "object", "concept"
+}
+
+# ===============================
+# AGENT-03: MODE CONFIGURATION
+# ===============================
+# Set to True to fetch ALL topics (no filtering) - good for research/exploration
+# Set to False for strict exam-grade validation - good for production/exams
+FETCH_ALL_TOPICS = True  # 🔥 Change to False for strict mode
 
 # ===============================
 # YOUTUBE TRANSCRIPT FETCHER
@@ -114,6 +153,419 @@ def clean_transcript(text):
     return text.strip()[:MAX_TRANSCRIPT_CHARS]
 
 # ===============================
+# AGENT-03: WEB SEARCH KNOWLEDGE ENRICHMENT
+# ===============================
+
+def extract_topics_from_transcript(transcript):
+    """Extract key topics from transcript using Ollama llama3:8b"""
+    prompt = f"""Extract 5-8 key educational topics from this transcript.
+Focus on specific, testable concepts (not generic words).
+
+Output as a JSON array of topic strings only.
+Example: ["x-ray radiation", "ionizing radiation safety", "medical imaging risks"]
+
+TRANSCRIPT:
+{transcript[:2000]}
+
+Output JSON array only:"""
+
+    try:
+        result = subprocess.run(
+            [OLLAMA_EXE, "run", OLLAMA_ENRICHMENT_MODEL, prompt],
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=120,
+            check=False
+        )
+        
+        if result.returncode != 0:
+            print(f"   ⚠ LLM topic extraction failed (return code {result.returncode})")
+            return []
+        
+        content = result.stdout.strip()
+        
+        # Debug logging (can be enabled for troubleshooting)
+        # print(f"🧪 Raw LLM output: {content[:500]}")
+        
+        # Extract JSON array
+        start = content.find("[")
+        end = content.rfind("]")
+        
+        if start == -1 or end == -1:
+            print(f"   ⚠ LLM output missing JSON brackets. Raw: {content[:200]}")
+            return []
+        
+        topics = json.loads(content[start:end + 1])
+        topics = topics if isinstance(topics, list) else []
+        
+        if topics:
+            print(f"   ✓ LLM extracted {len(topics)} topics")
+        else:
+            print(f"   ⚠ LLM returned empty topic list")
+        
+        return topics
+    except json.JSONDecodeError as e:
+        print(f"   ⚠ JSON parsing failed: {e}")
+        return []
+    except Exception as e:
+        print(f"   ⚠ Topic extraction error: {e}")
+        return []
+
+def fallback_topic_extraction(transcript):
+    """Fallback: Extract topics using keyword matching when LLM fails"""
+    # Common educational keywords/phrases that indicate testable topics
+    keyword_patterns = [
+        # Medical/Health
+        r"\b(?:x-ray|xray|radiation|ionizing radiation|medical imaging|radiology|dose|exposure|safety)\b",
+        r"\b(?:health risk|medical procedure|diagnostic|scan|imaging)\b",
+        # Technology
+        r"\b(?:machine learning|artificial intelligence|neural network|algorithm|data structure)\b",
+        r"\b(?:programming|software|hardware|computer|network|security)\b",
+        # Science
+        r"\b(?:chemical|reaction|molecule|atom|element|compound)\b",
+        r"\b(?:physics|force|energy|wave|particle|quantum)\b",
+        # Business/Economics
+        r"\b(?:marketing|seo|search engine|optimization|business strategy|economics)\b",
+        # General educational
+        r"\b(?:concept|principle|theory|method|technique|process|system)\b",
+    ]
+    
+    found_topics = set()
+    text_lower = transcript.lower()
+    
+    # Extract multi-word phrases that match patterns
+    for pattern in keyword_patterns:
+        matches = re.finditer(pattern, text_lower)
+        for match in matches:
+            # Get context around the match (2-3 words before/after)
+            start = max(0, match.start() - 30)
+            end = min(len(text_lower), match.end() + 30)
+            context = text_lower[start:end]
+            
+            # Extract meaningful phrases
+            words = context.split()
+            if len(words) >= 2:
+                # Try to form 2-3 word phrases
+                for i in range(len(words) - 1):
+                    phrase = " ".join(words[i:i+2])
+                    if len(phrase) > 5:
+                        # In FETCH_ALL mode, don't filter generic words
+                        if FETCH_ALL_TOPICS or not any(gw in phrase for gw in GENERIC_WORDS):
+                            found_topics.add(phrase)
+                for i in range(len(words) - 2):
+                    phrase = " ".join(words[i:i+3])
+                    if len(phrase) > 8:
+                        # In FETCH_ALL mode, don't filter generic words
+                        if FETCH_ALL_TOPICS or not any(gw in phrase for gw in GENERIC_WORDS):
+                            found_topics.add(phrase)
+    
+    topics = list(found_topics)[:8]  # Limit to 8 topics
+    if topics:
+        print(f"   ✓ Fallback extracted {len(topics)} topics from keywords")
+    return topics
+
+def validate_topics(topics):
+    """
+    Topic validation with two modes:
+    - FETCH_ALL_TOPICS = True  → allow everything (research/exploration mode)
+    - FETCH_ALL_TOPICS = False → strict exam-safe validation (production mode)
+    """
+    clean = set()
+    
+    for t in topics:
+        if not isinstance(t, str):
+            continue
+        t = t.strip().lower()
+        if not t:
+            continue
+        
+        # 🔥 FETCH ALL MODE: Accept everything (no filtering)
+        if FETCH_ALL_TOPICS:
+            clean.add(t)
+            continue
+        
+        # -------- STRICT MODE BELOW (Exam-grade safety) --------
+        # Domain-specific single terms that are acceptable
+        ACCEPTABLE_SINGLE_TERMS = {
+            "x-ray", "xray", "seo", "ai", "ml", "api", "dna", "rna"
+        }
+        
+        words = t.split()
+        
+        # Allow domain-specific single terms, otherwise require 2+ words
+        if len(words) < 2:
+            if t in ACCEPTABLE_SINGLE_TERMS:
+                # Accept single term if it's domain-specific
+                clean.add(t)
+            continue  # Otherwise skip single words
+        
+        # Skip generic words
+        if t in GENERIC_WORDS:
+            continue
+        
+        # Skip if any word in the topic is generic (but allow if it's part of a compound term)
+        has_generic = any(word in GENERIC_WORDS for word in words)
+        if has_generic and len(words) == 2:
+            # Allow 2-word phrases even if one word is generic (e.g., "machine learning")
+            pass
+        elif has_generic:
+            continue
+        
+        clean.add(t)
+    
+    return list(clean)
+
+def generate_search_queries(topic):
+    """Generate intelligent web search queries using Ollama llama3:8b"""
+    prompt = f"""Generate 4 high-quality educational web search queries for the topic: "{topic}"
+
+Rules:
+- Use clear academic phrasing
+- Avoid vague wording
+- Focus on explanation, risks, safety, and technical details
+- Each query should be different
+
+Output as JSON array of strings only.
+Example: ["What is {topic}?", "How does {topic} work?", "{topic} health effects", "{topic} safety precautions"]
+
+Output JSON array only:"""
+
+    try:
+        result = subprocess.run(
+            [OLLAMA_EXE, "run", OLLAMA_ENRICHMENT_MODEL, prompt],
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=120,
+            check=False
+        )
+        
+        if result.returncode != 0:
+            return []
+        
+        content = result.stdout.strip()
+        start = content.find("[")
+        end = content.rfind("]")
+        
+        if start == -1 or end == -1:
+            return []
+        
+        queries = json.loads(content[start:end + 1])
+        return queries if isinstance(queries, list) else []
+    except Exception as e:
+        print(f"⚠ Query generation failed for '{topic}': {e}")
+        return []
+
+def is_approved_domain(url):
+    """Check if URL is from an approved domain"""
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        
+        # Check exact matches
+        for approved in APPROVED_DOMAINS:
+            if approved in domain:
+                return True
+        
+        # Check TLD matches
+        if domain.endswith('.edu') or domain.endswith('.gov') or domain.endswith('.org'):
+            return True
+        
+        return False
+    except:
+        return False
+
+def fetch_clean_text(url, max_chars=4000):
+    """Fetch and clean text content from a web page"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Remove unwanted elements
+        for tag in soup(["script", "style", "nav", "footer", "aside", "header", "iframe"]):
+            tag.decompose()
+        
+        # Get text content
+        text = soup.get_text(separator=" ")
+        
+        # Clean whitespace
+        text = re.sub(r'\s+', ' ', text)
+        text = text.strip()
+        
+        return text[:max_chars]
+    except Exception as e:
+        print(f"⚠ Failed to fetch {url}: {e}")
+        return ""
+
+def search_wikipedia_direct(query):
+    """Try Wikipedia API directly (more reliable)"""
+    try:
+        # Extract main topic from query
+        topic = query.split()[0:3]  # First few words
+        topic = " ".join(topic).lower()
+        
+        # Wikipedia API search
+        api_url = "https://en.wikipedia.org/api/rest_v1/page/summary/" + requests.utils.quote(topic)
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        response = requests.get(api_url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if 'content_urls' in data and 'desktop' in data['content_urls']:
+                return [data['content_urls']['desktop']['page']]
+    except:
+        pass
+    return []
+
+def search_web_safely(query, max_results=2):
+    """Perform controlled web search (approved domains only)"""
+    results = []
+    
+    # Try Wikipedia API first (more reliable)
+    wiki_results = search_wikipedia_direct(query)
+    results.extend(wiki_results)
+    
+    if len(results) >= max_results:
+        return results[:max_results]
+    
+    # Fallback: DuckDuckGo HTML search
+    try:
+        search_url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(search_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Find result links (DuckDuckGo structure may vary)
+        for link in soup.find_all('a', limit=20):
+            href = link.get('href', '')
+            if href and is_approved_domain(href):
+                if href not in results:
+                    results.append(href)
+                    if len(results) >= max_results:
+                        break
+    except Exception as e:
+        # Silently fail - Wikipedia might have worked
+        pass
+    
+    return results[:max_results]
+
+def synthesize_knowledge(topic, web_texts):
+    """Synthesize web content into structured knowledge using Ollama llama3:8b"""
+    combined_text = "\n\n---\n\n".join(web_texts[:3])  # Use up to 3 sources
+    combined_text = combined_text[:3000]  # Limit input size
+    
+    prompt = f"""Summarize the following content into a clear, exam-ready explanation for the topic: "{topic}"
+
+Rules:
+- Educational tone
+- Fact-based
+- Avoid fluff
+- 200-300 words
+- Focus on key concepts that would be tested in an exam
+
+CONTENT:
+{combined_text}
+
+Provide a concise, educational summary:"""
+
+    try:
+        result = subprocess.run(
+            [OLLAMA_EXE, "run", OLLAMA_ENRICHMENT_MODEL, prompt],
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=180,
+            check=False
+        )
+        
+        if result.returncode != 0:
+            return ""
+        
+        return result.stdout.strip()
+    except Exception as e:
+        print(f"⚠ Knowledge synthesis failed for '{topic}': {e}")
+        return ""
+
+def enrich_knowledge_with_web_search(transcript):
+    """Agent-03: Main function to enrich transcript with web knowledge"""
+    mode_str = "FETCH_ALL (no filtering)" if FETCH_ALL_TOPICS else "STRICT (exam-safe)"
+    print(f"\n🧠 Agent-03: Web Knowledge Enrichment [{mode_str}]")
+    print("   Extracting topics from transcript...")
+    
+    # Step 1: Extract topics (LLM-first approach)
+    topics = extract_topics_from_transcript(transcript)
+    
+    # Step 1b: Fallback to keyword-based extraction if LLM fails
+    if not topics:
+        print("   ⚠ LLM topic extraction failed, trying fallback extractor...")
+        topics = fallback_topic_extraction(transcript)
+        if not topics:
+            print("   ⚠ No topics extracted (LLM + fallback both failed), skipping enrichment")
+            print("   ℹ This is normal for very short, casual, or unclear transcripts")
+            return ""
+        print("   ✓ Fallback extraction succeeded")
+    else:
+        print(f"   ✓ LLM extracted {len(topics)} topics")
+    
+    # Step 2: Validate topics
+    validated_topics = validate_topics(topics)
+    if not validated_topics:
+        print("   ⚠ No valid topics after validation, skipping enrichment")
+        print("   ℹ Topics may be too generic or transcript too vague")
+        return ""
+    
+    print(f"   ✓ Validated {len(validated_topics)} topics (from {len(topics)} extracted)")
+    
+    # Step 3-6: For each topic, generate queries, search, fetch, and synthesize
+    enriched_knowledge = []
+    
+    for topic in validated_topics[:3]:  # Limit to top 3 topics to avoid timeout
+        print(f"   📚 Enriching: {topic}")
+        
+        # Generate queries
+        queries = generate_search_queries(topic)
+        if not queries:
+            continue
+        
+        # Search and fetch content
+        web_texts = []
+        for query in queries[:2]:  # Limit to 2 queries per topic
+            urls = search_web_safely(query, max_results=1)
+            for url in urls:
+                text = fetch_clean_text(url)
+                if text:
+                    web_texts.append(text)
+        
+        if not web_texts:
+            continue
+        
+        # Synthesize knowledge
+        knowledge = synthesize_knowledge(topic, web_texts)
+        if knowledge:
+            enriched_knowledge.append(f"## {topic}\n{knowledge}")
+    
+    if not enriched_knowledge:
+        print("   ⚠ No enriched knowledge generated")
+        return ""
+    
+    result = "\n\n".join(enriched_knowledge)
+    print(f"   ✓ Generated enriched knowledge ({len(result)} chars)")
+    return result
+
+# ===============================
 # HARD DEDUP (FINAL GUARANTEE)
 # ===============================
 def deduplicate(questions):
@@ -185,23 +637,34 @@ def repair_json(json_str):
 # ===============================
 # OLLAMA MCQ GENERATOR (DIRECT BINARY)
 # ===============================
-def generate_mcqs_with_ollama(transcript, max_retries=3):
-    """Generate MCQs using Ollama binary directly - ensures exactly 20 questions with retries"""
+def generate_mcqs_with_ollama(transcript, max_retries=10):
+    """Generate MCQs using Ollama binary directly - ensures EXACTLY 20 questions (not less, not more)"""
     all_questions = []
+    TARGET_COUNT = 20  # EXACTLY 20 questions required
     
     for attempt in range(max_retries + 1):
         if attempt > 0:
-            needed = 20 - len(all_questions)
+            needed = TARGET_COUNT - len(all_questions)
             if needed <= 0:
-                break
-            print(f"🔄 Retry {attempt}/{max_retries}: Generating {needed} more questions...")
+                # We have enough, but need to trim to exactly 20
+                if len(all_questions) > TARGET_COUNT:
+                    print(f"✓ Trimming to exactly {TARGET_COUNT} questions (had {len(all_questions)})")
+                    return all_questions[:TARGET_COUNT]
+                elif len(all_questions) == TARGET_COUNT:
+                    print(f"✓ SUCCESS: Generated exactly {TARGET_COUNT} questions")
+                    return all_questions
+            print(f"🔄 Retry {attempt}/{max_retries}: Need {needed} more questions (have {len(all_questions)}/{TARGET_COUNT})...")
             
             # Generate only the missing questions
             prompt = f"""Generate EXACTLY {needed} MORE unique multiple-choice questions from this transcript.
 
-CRITICAL: These must be DIFFERENT from questions already generated. Each question must test a UNIQUE concept.
+CRITICAL REQUIREMENTS:
+- Generate EXACTLY {needed} questions (not {needed-1}, not {needed+1}, EXACTLY {needed})
+- These must be COMPLETELY DIFFERENT from questions already generated
+- Each question must test a UNIQUE concept
+- Output ONLY valid JSON, no other text
 
-JSON FORMAT:
+JSON FORMAT (EXACTLY {needed} questions):
 {{
   "questions": [
     {{
@@ -216,18 +679,18 @@ JSON FORMAT:
 TRANSCRIPT:
 {transcript[:MAX_TRANSCRIPT_CHARS]}
 
-Generate EXACTLY {needed} NEW unique questions (JSON only):"""
+Generate EXACTLY {needed} NEW unique questions. Output JSON only:"""
         else:
             # First attempt - generate all 20
             prompt = f"""Generate EXACTLY 20 unique multiple-choice questions from this transcript.
 
-REQUIREMENTS:
-- EXACTLY 20 questions (no more, no less)
+CRITICAL REQUIREMENTS:
+- Generate EXACTLY 20 questions (not 19, not 21, EXACTLY 20)
 - Each question tests a DIFFERENT concept
-- NO repeats - every question unique
-- Output ONLY valid JSON
+- NO repeats - every question must be unique
+- Output ONLY valid JSON, no markdown, no explanations outside JSON
 
-JSON FORMAT:
+JSON FORMAT (EXACTLY 20 questions):
 {{
   "questions": [
     {{
@@ -242,7 +705,7 @@ JSON FORMAT:
 TRANSCRIPT:
 {transcript[:MAX_TRANSCRIPT_CHARS]}
 
-Generate EXACTLY 20 questions now (JSON only):"""
+Generate EXACTLY 20 questions. Output JSON only:"""
         
         print("🧠 Generating 20 UNIQUE MCQs using Ollama binary (local, free)")
         if attempt == 0:
@@ -363,13 +826,16 @@ Generate EXACTLY 20 questions now (JSON only):"""
             all_questions.extend(new_questions)
             all_questions = deduplicate(all_questions)
             
-            # Check if we have enough
-            if len(all_questions) >= 20:
-                print(f"✓ SUCCESS: Generated exactly {len(all_questions)} unique questions (using first 20)")
-                return all_questions[:20]
+            # Check if we have exactly 20
+            if len(all_questions) == TARGET_COUNT:
+                print(f"✓ SUCCESS: Generated exactly {TARGET_COUNT} unique questions")
+                return all_questions
+            elif len(all_questions) > TARGET_COUNT:
+                print(f"✓ SUCCESS: Generated {len(all_questions)} questions, trimming to exactly {TARGET_COUNT}")
+                return all_questions[:TARGET_COUNT]
             
             # If we still need more and have retries left, continue
-            if len(all_questions) < 20 and attempt < max_retries:
+            if len(all_questions) < TARGET_COUNT and attempt < max_retries:
                 continue
         
         except FileNotFoundError:
@@ -395,15 +861,26 @@ Generate EXACTLY 20 questions now (JSON only):"""
             else:
                 raise
     
-    # Final result
-    if len(all_questions) >= 20:
-        print(f"✓ SUCCESS: Generated {len(all_questions)} unique questions (using first 20)")
-        return all_questions[:20]
-    else:
-        print(f"⚠ Final result: {len(all_questions)} unique questions (requested 20)")
-        if len(all_questions) < 10:
-            print("⚠ Too few questions. The model may be struggling. Try a different model or shorter transcript.")
+    # Final result - MUST have exactly 20
+    if len(all_questions) == TARGET_COUNT:
+        print(f"✓ SUCCESS: Generated exactly {TARGET_COUNT} unique questions")
         return all_questions
+    elif len(all_questions) > TARGET_COUNT:
+        print(f"✓ SUCCESS: Generated {len(all_questions)} questions, trimming to exactly {TARGET_COUNT}")
+        return all_questions[:TARGET_COUNT]
+    else:
+        # CRITICAL: We MUST have exactly 20, raise error if we can't get it
+        raise RuntimeError(
+            f"❌ FAILED: Could not generate exactly {TARGET_COUNT} questions after {max_retries + 1} attempts.\n"
+            f"   Generated: {len(all_questions)} questions\n"
+            f"   Required: {TARGET_COUNT} questions\n"
+            f"   Missing: {TARGET_COUNT - len(all_questions)} questions\n\n"
+            f"   Possible solutions:\n"
+            f"   1. Use a longer/more detailed video\n"
+            f"   2. Try a different Ollama model (e.g., llama3:8b)\n"
+            f"   3. Check if transcript is too short or unclear\n"
+            f"   4. Increase max_retries in the code"
+        )
 
 # ===============================
 # MAIN
@@ -427,8 +904,27 @@ def main():
 
     transcript = clean_transcript(transcript)
 
-    questions = generate_mcqs_with_ollama(transcript)
+    # Agent-03: Enrich knowledge with web search
+    enriched_knowledge = enrich_knowledge_with_web_search(transcript)
+    
+    # Merge transcript with enriched knowledge
+    if enriched_knowledge:
+        enriched_context = f"{transcript}\n\n--- ENRICHED KNOWLEDGE ---\n\n{enriched_knowledge}"
+        print("\n✓ Merging transcript with enriched knowledge...")
+    else:
+        enriched_context = transcript
+        print("\n✓ Using transcript only (no enrichment)")
 
+    questions = generate_mcqs_with_ollama(enriched_context)
+
+    # Final validation: MUST have exactly 20 questions
+    if len(questions) != 20:
+        raise RuntimeError(
+            f"❌ CRITICAL ERROR: Expected exactly 20 questions, but got {len(questions)}.\n"
+            f"   This should not happen. Please report this issue."
+        )
+
+    print(f"\n✓ VALIDATED: Exactly {len(questions)} questions generated")
     print("\n" + "=" * 80)
     for i, q in enumerate(questions, 1):
         print(f"\nQ{i}. {q.get('question', 'N/A')}")
@@ -445,6 +941,54 @@ def main():
         json.dump({"questions": questions}, f, indent=2, ensure_ascii=False)
 
     print("\n✓ Saved to quiz_results.json")
+
+# ===============================
+# API WRAPPER FUNCTION (for FastAPI/REST API)
+# ===============================
+def generate_quiz_from_url(youtube_url: str):
+    """
+    Generate 20 unique MCQs from a YouTube URL.
+    
+    This is a clean wrapper function for API usage (no CLI prints, no file I/O).
+    Returns the questions list directly.
+    
+    Args:
+        youtube_url: YouTube video URL
+        
+    Returns:
+        List of 20 MCQ dictionaries with keys: question, options, correct_answer, explanation
+        
+    Raises:
+        RuntimeError: If exactly 20 questions cannot be generated
+        Exception: For transcript fetching or processing errors
+    """
+    fetcher = YouTubeTranscriptFetcher()
+    
+    try:
+        transcript = fetcher.fetch(youtube_url)
+    except Exception:
+        transcript = WhisperAudioTranscriber().transcribe(youtube_url)
+    
+    transcript = clean_transcript(transcript)
+    
+    # Agent-03: Enrich knowledge with web search
+    enriched_knowledge = enrich_knowledge_with_web_search(transcript)
+    
+    # Merge transcript with enriched knowledge
+    if enriched_knowledge:
+        enriched_context = f"{transcript}\n\n--- ENRICHED KNOWLEDGE ---\n\n{enriched_knowledge}"
+    else:
+        enriched_context = transcript
+    
+    questions = generate_mcqs_with_ollama(enriched_context)
+    
+    # Final validation: MUST have exactly 20 questions
+    if len(questions) != 20:
+        raise RuntimeError(
+            f"Expected exactly 20 questions, but got {len(questions)}"
+        )
+    
+    return questions
 
 # ===============================
 if __name__ == "__main__":
