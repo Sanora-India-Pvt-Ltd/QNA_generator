@@ -30,10 +30,10 @@ from bs4 import BeautifulSoup
 # ===============================
 # OLLAMA CONFIG (FAST + STABLE)
 # ===============================
-OLLAMA_EXE = r"C:\Users\Hp\AppData\Local\Programs\Ollama\ollama.exe"
+OLLAMA_CMD = "/usr/local/bin/ollama"  # Linux/Azure: absolute path (do not rely on PATH)
 OLLAMA_MODEL = "gemma2:2b"  # Fast model, good for MCQs. Alternatives: "llama3", "mistral"
-OLLAMA_ENRICHMENT_MODEL = "llama3:8b"  # Better model for knowledge enrichment tasks
-MAX_TRANSCRIPT_CHARS = 4000   # speed-critical
+OLLAMA_ENRICHMENT_MODEL = "mistral:7b"  # Safe for 8GB RAM (replaced llama3:8b)
+MAX_TRANSCRIPT_CHARS = 3000   # Reduced for faster processing on cloud VMs
 
 # ===============================
 # AGENT-03: WEB SEARCH CONFIG
@@ -61,7 +61,7 @@ GENERIC_WORDS = {
 # ===============================
 # Set to True to fetch ALL topics (no filtering) - good for research/exploration
 # Set to False for strict exam-grade validation - good for production/exams
-FETCH_ALL_TOPICS = True  # 🔥 Change to False for strict mode
+FETCH_ALL_TOPICS = False  # 🔥 Set to False for production (faster, exam-safe)
 
 # ===============================
 # YOUTUBE TRANSCRIPT FETCHER
@@ -107,42 +107,94 @@ class WhisperAudioTranscriber:
         self.model = whisper.load_model(model)
 
     def download_audio(self, url):
-        path = os.path.join(tempfile.gettempdir(), "yt_audio")
+        """Download audio from YouTube URL and return path to MP3 file"""
+        # Use unique temp file to avoid conflicts
+        temp_dir = tempfile.gettempdir()
+        temp_file = tempfile.NamedTemporaryFile(
+            suffix=".mp3",
+            prefix="yt_audio_",
+            dir=temp_dir,
+            delete=False
+        )
+        temp_file.close()
+        audio_path = temp_file.name
 
         opts = {
             "format": "bestaudio/best",
-            "outtmpl": path + ".%(ext)s",
+            "outtmpl": audio_path.replace(".mp3", ".%(ext)s"),
             "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}
+                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
             ],
-            "quiet": True,
-            "retries": 5,
-            "fragment_retries": 5,
-
-            # ✅ CORRECT js_runtimes FORMAT
-            "js_runtimes": {
-                "node": {}
-            },
-
-            "http_headers": {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                )
-            }
+            "quiet": False,
+            "no_warnings": True,
+            "retries": 10,
+            "fragment_retries": 10,
+            "user_agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
         }
 
-        with self.yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
+        # Optional: Add cookiefile if it exists (for Azure/Linux)
+        cookie_paths = [
+            "/home/azureuser/cookies.txt",
+            os.path.expanduser("~/cookies.txt"),
+            os.path.join(os.getcwd(), "cookies.txt")
+        ]
+        for cookie_path in cookie_paths:
+            if os.path.exists(cookie_path):
+                opts["cookiefile"] = cookie_path
+                break
 
-        return path + ".mp3"
+        try:
+            with self.yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+            
+            # Verify file was created
+            if not os.path.exists(audio_path):
+                # Try alternative path (yt-dlp might add extension)
+                alt_paths = [
+                    audio_path.replace(".mp3", ".webm"),
+                    audio_path.replace(".mp3", ".m4a"),
+                    audio_path.replace(".mp3", ".opus"),
+                ]
+                for alt_path in alt_paths:
+                    if os.path.exists(alt_path):
+                        audio_path = alt_path
+                        break
+                else:
+                    raise RuntimeError(f"Audio file not found after download: {audio_path}")
+            
+            return audio_path
+        except Exception as e:
+            # Clean up on error
+            if os.path.exists(audio_path):
+                try:
+                    os.remove(audio_path)
+                except:
+                    pass
+            raise RuntimeError(f"Failed to download audio: {str(e)}")
 
     def transcribe(self, url):
-        audio = self.download_audio(url)
-        result = self.model.transcribe(audio)
-        os.remove(audio)
-        return result["text"]
+        """Transcribe audio from YouTube URL using Whisper"""
+        audio_path = None
+        try:
+            audio_path = self.download_audio(url)
+            if not os.path.exists(audio_path):
+                raise RuntimeError(f"Audio file not found: {audio_path}")
+            
+            result = self.model.transcribe(audio_path)
+            return result["text"]
+        except Exception as e:
+            raise RuntimeError(f"Whisper transcription failed: {str(e)}")
+        finally:
+            # Always clean up audio file
+            if audio_path and os.path.exists(audio_path):
+                try:
+                    os.remove(audio_path)
+                except Exception:
+                    pass  # Ignore cleanup errors
 
 # ===============================
 # CLEAN + SHRINK TRANSCRIPT
@@ -171,7 +223,7 @@ Output JSON array only:"""
 
     try:
         result = subprocess.run(
-            [OLLAMA_EXE, "run", OLLAMA_ENRICHMENT_MODEL, prompt],
+            [OLLAMA_CMD, "run", OLLAMA_ENRICHMENT_MODEL, prompt],
             capture_output=True,
             text=True,
             encoding='utf-8',
@@ -334,7 +386,7 @@ Output JSON array only:"""
 
     try:
         result = subprocess.run(
-            [OLLAMA_EXE, "run", OLLAMA_ENRICHMENT_MODEL, prompt],
+            [OLLAMA_CMD, "run", OLLAMA_ENRICHMENT_MODEL, prompt],
             capture_output=True,
             text=True,
             encoding='utf-8',
@@ -482,7 +534,7 @@ Provide a concise, educational summary:"""
 
     try:
         result = subprocess.run(
-            [OLLAMA_EXE, "run", OLLAMA_ENRICHMENT_MODEL, prompt],
+            [OLLAMA_CMD, "run", OLLAMA_ENRICHMENT_MODEL, prompt],
             capture_output=True,
             text=True,
             encoding='utf-8',
@@ -713,9 +765,9 @@ Generate EXACTLY 20 questions. Output JSON only:"""
         
         # Call Ollama binary directly via subprocess
         try:
-            # Use UTF-8 encoding to avoid Windows encoding issues
+            # Use UTF-8 encoding to avoid encoding issues
             result = subprocess.run(
-                [OLLAMA_EXE, "run", OLLAMA_MODEL, prompt],
+                [OLLAMA_CMD, "run", OLLAMA_MODEL, prompt],
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
@@ -728,7 +780,7 @@ Generate EXACTLY 20 questions. Output JSON only:"""
                 raise RuntimeError(
                     f"Ollama failed with return code {result.returncode}\n"
                     f"Error: {result.stderr}\n"
-                    f"Make sure Ollama is installed at: {OLLAMA_EXE}\n"
+                    f"Make sure Ollama is installed at: {OLLAMA_CMD}\n"
                     f"And model is pulled: ollama pull {OLLAMA_MODEL}"
                 )
             
@@ -843,7 +895,7 @@ Generate EXACTLY 20 questions. Output JSON only:"""
                 print(f"⚠ Ollama not found, retrying...")
                 continue
             raise RuntimeError(
-                f"Ollama executable not found at: {OLLAMA_EXE}\n"
+                f"Ollama executable not found at: {OLLAMA_CMD}\n"
                 f"Make sure Ollama is installed. Download from: https://ollama.com"
             )
         except subprocess.TimeoutExpired:
