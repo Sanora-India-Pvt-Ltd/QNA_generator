@@ -1,14 +1,21 @@
 """
 FAST MCQ Generator + MySQL Cache
 
-Endpoints:
+Primary Endpoint (RECOMMENDED):
+POST /videos/mcqs -> Single endpoint, everything in JSON body (no query params)
+  - Send video_url in body → get MCQs back
+  - Handles generation + caching internally
+  - No Params tab needed in Postman!
+
+Other Endpoints:
 1) POST /generate-and-save  -> generate MCQs ONCE and save to MySQL
-2) GET  /videos/{video_id}/mcqs -> fetch instantly (<5 sec target)
-3) POST /videos/mcqs/by-url -> convenience fetch by URL
+2) GET  /videos/{video_id}/mcqs -> fetch instantly by video_id
+3) POST /videos/mcqs/by-url -> [DEPRECATED] Use POST /videos/mcqs instead
 
 Notes:
 - Default fetch does NOT include correct_answer (anti-cheat)
 - video_id is deterministic from URL (sha1)
+- POST /videos/mcqs handles everything: cache check → generate if needed → return
 """
 
 import os
@@ -173,6 +180,13 @@ class FetchByUrlRequest(BaseModel):
     include_answers: bool = False
     randomize: bool = True
     limit: int = Field(default=20, ge=1, le=50)
+
+class MCQRequest(BaseModel):
+    """Single endpoint request - everything in body, no query params"""
+    video_url: str = Field(..., description="Video URL to generate/fetch MCQs from")
+    include_answers: bool = Field(default=False, description="Include correct answers (anti-cheat: default false)")
+    randomize: bool = Field(default=True, description="Shuffle questions")
+    limit: int = Field(default=20, ge=1, le=50, description="Number of questions to return")
 
 # ===============================
 # UTILS
@@ -628,8 +642,101 @@ async def fetch_mcqs(
             "questions": qs2
         }
 
+@app.post("/videos/mcqs")
+async def get_mcqs(request: MCQRequest):
+    """
+    Single endpoint to get MCQs from video URL.
+    
+    **Everything in POST body - no query params, no Params tab.**
+    
+    This endpoint handles everything internally:
+    1. Generates video_id from URL
+    2. Checks MySQL cache
+    3. Generates MCQs if not cached
+    4. Returns MCQs instantly
+    
+    **Request Body:**
+    - `video_url`: Video URL (required)
+    - `include_answers`: Include correct answers (default: false)
+    - `randomize`: Shuffle questions (default: true)
+    - `limit`: Number of questions (default: 20, max: 50)
+    
+    **Postman Usage:**
+    - Method: POST
+    - URL: /videos/mcqs
+    - Body → raw → JSON
+    - No Params tab needed!
+    """
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="DATABASE_URL not configured")
+    
+    video_url = request.video_url
+    video_id = make_video_id(video_url)
+    
+    async with SessionLocal() as session:
+        try:
+            # Check cache first
+            row = await db_get(session, video_id)
+            
+            if row:
+                # MCQs exist in cache - return them
+                qs = (row.questions or {}).get("questions", [])
+                if not isinstance(qs, list) or len(qs) == 0:
+                    raise HTTPException(status_code=500, detail="DB record has no questions.")
+                
+                qs2 = qs[:]
+                if request.randomize:
+                    random.shuffle(qs2)
+                qs2 = qs2[:min(request.limit, len(qs2))]
+                
+                if not request.include_answers:
+                    qs2 = strip_answers(qs2)
+                
+                return {
+                    "status": "success",
+                    "video_id": video_id,
+                    "count": len(qs2),
+                    "cached": True,
+                    "questions": qs2
+                }
+            
+            # Not in cache - generate MCQs
+            t0 = time.time()
+            qs = generate_mcqs_from_video_fast(video_url)
+            await db_upsert(session, video_id, video_url, qs)
+            await session.commit()
+            dt = time.time() - t0
+            
+            # Process questions according to request
+            qs2 = qs[:]
+            if request.randomize:
+                random.shuffle(qs2)
+            qs2 = qs2[:min(request.limit, len(qs2))]
+            
+            if not request.include_answers:
+                qs2 = strip_answers(qs2)
+            
+            return {
+                "status": "success",
+                "video_id": video_id,
+                "count": len(qs2),
+                "cached": False,
+                "time_seconds": round(dt, 2),
+                "questions": qs2
+            }
+            
+        except Exception as e:
+            await session.rollback()
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/videos/mcqs/by-url")
 async def fetch_mcqs_by_url(url: str = Query(...), req: FetchByUrlRequest = FetchByUrlRequest()):
+    """
+    [DEPRECATED] Use POST /videos/mcqs instead.
+    
+    This endpoint is kept for backward compatibility only.
+    """
     vid = make_video_id(url)
     return await fetch_mcqs(
         vid,
@@ -712,11 +819,13 @@ async def verify_video_saved(video_id: str):
 def root():
     return {
         "service": "Fast Video MCQ Generator + MySQL Cache",
+        "primary_endpoint": "POST /videos/mcqs - Single endpoint, everything in body (no query params)",
         "endpoints": [
-            "POST /generate-and-save",
-            "GET /videos/{video_id}/mcqs",
-            "POST /videos/mcqs/by-url?url=..."
+            "POST /videos/mcqs - [RECOMMENDED] Single endpoint, all params in JSON body",
+            "POST /generate-and-save - Generate and save MCQs (returns video_id)",
+            "GET /videos/{video_id}/mcqs - Fetch MCQs by video_id",
+            "POST /videos/mcqs/by-url - [DEPRECATED] Use POST /videos/mcqs instead"
         ],
-        "note": "Generate once, then fetch from DB instantly."
+        "note": "Generate once, then fetch from DB instantly. Use POST /videos/mcqs for simplest integration."
     }
 
