@@ -223,6 +223,28 @@ app.add_middleware(
 )
 
 # ===============================
+# UTILITY FUNCTIONS
+# ===============================
+def normalize_question_order(questions: list) -> list:
+    """
+    Force static timeline order based on timestamp_seconds.
+    Also updates part_number to be sequential (1..N).
+    
+    This ensures consistent ordering for both cached and fresh generation paths.
+    """
+    if not questions:
+        return questions
+    
+    # Sort by timestamp_seconds (ascending - chronological order)
+    questions.sort(key=lambda q: q.get("timestamp_seconds", 0))
+    
+    # Update part_number to be sequential (1..N) based on sorted order
+    for i, q in enumerate(questions, start=1):
+        q["part_number"] = i
+    
+    return questions
+
+# ===============================
 # REQUEST MODELS
 # ===============================
 class GenerateSaveRequest(BaseModel):
@@ -3107,6 +3129,8 @@ async def generate_and_save(req: GenerateSaveRequest):
                     # Include questions if requested
                     if req.include_questions:
                         qs = (existing.questions or {}).get("questions", [])
+                        # ✅ Apply sorting before returning (cache path)
+                        qs = normalize_question_order(qs)
                         if not req.include_answers:
                             qs = strip_answers(qs)
                         response["questions"] = qs
@@ -3151,6 +3175,8 @@ async def generate_and_save(req: GenerateSaveRequest):
             }
             # Include questions if requested
             if req.include_questions:
+                # ✅ Apply sorting before returning (fresh generation path)
+                qs = normalize_question_order(qs)
                 if not req.include_answers:
                     qs = strip_answers(qs)
                 response["questions"] = qs
@@ -3180,6 +3206,9 @@ async def fetch_mcqs(
             raise HTTPException(status_code=500, detail="DB record has no questions.")
 
         qs2 = qs[:]
+        # ✅ Apply sorting BEFORE randomize/limit (by-url endpoint)
+        qs2 = normalize_question_order(qs2)
+        
         if randomize:
             random.shuffle(qs2)
         qs2 = qs2[:min(limit, len(qs2))]
@@ -3279,6 +3308,9 @@ async def get_mcqs(request: MCQRequest):
                 
                 # ✅ If cache was accepted (full or partial), return it
                 if row and 'qs2' in locals():
+                    # ✅ Apply sorting BEFORE randomize/limit (cache path)
+                    qs2 = normalize_question_order(qs2)
+                    
                     if request.randomize:
                         random.shuffle(qs2)
                     qs2 = qs2[:min(request.limit, len(qs2))]
@@ -3359,6 +3391,9 @@ async def get_mcqs(request: MCQRequest):
             
             # Process questions according to request
             qs2 = qs[:]
+            # ✅ Apply sorting BEFORE randomize/limit (fresh generation path)
+            qs2 = normalize_question_order(qs2)
+            
             if request.randomize:
                 random.shuffle(qs2)
             qs2 = qs2[:min(request.limit, len(qs2))]
