@@ -191,3 +191,4 @@ Anchor metadata used `sentence_index` (text position), not time-based semantics.
 **All fixes applied and verified. System is production-ready for exam-grade content.**
 
 
+

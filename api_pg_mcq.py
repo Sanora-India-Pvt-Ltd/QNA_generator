@@ -31,9 +31,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 # ===============================
 DATABASE_URL = os.getenv("DATABASE_URL", "")  # mysql+aiomysql://...
 
-# MCQ Writer Model: qwen2.5:3b (upgraded from 1.5b for improved exam-language quality)
-# Architecture unchanged - only language quality improves
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+# Whisper model for transcription
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "base")
 
 MCQ_COUNT = int(os.getenv("MCQ_COUNT", "20"))
@@ -49,7 +47,6 @@ RANDOM_PICK_COUNT = int(os.getenv("RANDOM_PICK_COUNT", "8"))
 CHUNK_WORDS = int(os.getenv("CHUNK_WORDS", "120"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "35"))
 
-OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "60"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 
 # ✅ SOFT-FAIL MODE: After N rejections per anchor, force-accept one MCQ (prevents 0-MCQ issue)
@@ -85,14 +82,31 @@ VALIDATION_RULE_VERSION = "2.0"
 # Teachers often pause 0.5-1.0s after finishing a topic
 TOPIC_END_DELAY = float(os.getenv("TOPIC_END_DELAY", "0.8"))  # seconds
 
+# Topic-Chunk Mode: Use 3 chunks for 5 questions (fast, deterministic)
+USE_TOPIC_CHUNK_MODE = os.getenv("USE_TOPIC_CHUNK_MODE", "false").lower() == "true"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")  # Fast model for question generation
+
 # Legacy Fill Mode - Allow filling remaining MCQs with legacy chunks if exam-grade generation < target
 # Set ALLOW_LEGACY_FILL=false for strict exam-grade mode (may return < 20 questions)
 # ✅ FIX 1: Default to False for exam-grade mode (strict, no legacy leakage)
 ALLOW_LEGACY_FILL = os.getenv("ALLOW_LEGACY_FILL", "false").lower() == "true"
 
+# ✅ ALLOWED ANCHOR TYPES: Only these anchor types are valid, others are coerced to PROCESS
+ALLOWED_ANCHORS = {
+    "DEFINITION",
+    "PROCESS",
+    "COMPARISON",
+    "ADVANTAGE",
+    "RISK",
+    "DECISION",
+    "TOPIC_CHUNK"  # Topic-chunk based questions
+}
+
 # Print mode on startup for debugging
-print(f"🔧 USE_ANCHOR_MODE = {USE_ANCHOR_MODE} ({'EXAM-GRADE' if USE_ANCHOR_MODE else 'LEGACY'})")
-print(f"🤖 OLLAMA_MODEL = {OLLAMA_MODEL} (MCQ Writer Model)")
+print(f"📦 USE_TOPIC_CHUNK_MODE = {USE_TOPIC_CHUNK_MODE} ({'3 chunks → 5 questions (Groq)' if USE_TOPIC_CHUNK_MODE else 'Disabled'})")
+if USE_TOPIC_CHUNK_MODE:
+    print(f"⚡ GROQ_MODEL = {GROQ_MODEL} (Topic-Chunk Question Generator)")
 print(f"✅ VALIDATION_RULE_VERSION = {VALIDATION_RULE_VERSION} (Cache invalidation)")
 print(f"📊 ALLOW_LEGACY_FILL = {ALLOW_LEGACY_FILL} ({'Practice Mode (always 20)' if ALLOW_LEGACY_FILL else 'Exam Mode (strict)'})")
 print(f"🔄 USE_HYBRID_MODE = {USE_HYBRID_MODE} ({f'{EXAM_GRADE_COUNT} exam-grade + {LEGACY_COUNT} legacy' if USE_HYBRID_MODE else 'Pure mode'})")
@@ -150,22 +164,7 @@ class VideoMCQ(Base):
 
 # ===============================
 # AUTO-DETECT OLLAMA
-# ===============================
-def find_ollama() -> str | None:
-    p = shutil.which("ollama")
-    if p:
-        return p
-    try:
-        r = subprocess.run(["ollama", "--version"], capture_output=True, text=True, timeout=2)
-        if r.returncode == 0:
-            return "ollama"
-    except Exception:
-        pass
-    return None
-
-OLLAMA_EXE = find_ollama()
-if not OLLAMA_EXE:
-    print("⚠️ WARNING: Ollama not found. Install Ollama and ensure `ollama` is in PATH.")
+# Ollama removed - using Groq API only
 
 # ===============================
 # LOAD WHISPER
@@ -225,6 +224,21 @@ app.add_middleware(
 # ===============================
 # UTILITY FUNCTIONS
 # ===============================
+def validate_anchor_type(anchor_type: str) -> str:
+    """
+    Validate anchor type and coerce invalid types to PROCESS.
+    
+    Args:
+        anchor_type: The anchor type to validate
+        
+    Returns:
+        Validated anchor type (coerced to PROCESS if invalid)
+    """
+    if not anchor_type or anchor_type not in ALLOWED_ANCHORS:
+        print(f"⚠️ Warning: Anchor type '{anchor_type}' is invalid, coercing to 'PROCESS'")
+        return "PROCESS"
+    return anchor_type
+
 def normalize_question_order(questions: list) -> list:
     """
     Force static timeline order based on timestamp_seconds.
@@ -243,6 +257,278 @@ def normalize_question_order(questions: list) -> list:
         q["part_number"] = i
     
     return questions
+
+def build_topic_chunks(transcript_segments: List[Dict[str, Any]], video_duration: float) -> List[Dict[str, Any]]:
+    """
+    Build 3 topic chunks from Whisper segments (deterministic, no LLM needed).
+    
+    Strategy:
+    - Chunk 1: 0% → 35%
+    - Chunk 2: 35% → 70%
+    - Chunk 3: 70% → 100%
+    
+    Then snap each chunk end to the nearest Whisper segment end.
+    
+    Args:
+        transcript_segments: List of segments with {text, start, end}
+        video_duration: Total video duration in seconds
+        
+    Returns:
+        List of 3 chunks, each with {text, start, end, target_end_percent}
+    """
+    if not transcript_segments or video_duration <= 0:
+        return []
+    
+    # Define chunk boundaries as percentages
+    chunk_boundaries = [
+        {"start_percent": 0.0, "end_percent": 0.35, "chunk_num": 1},
+        {"start_percent": 0.35, "end_percent": 0.70, "chunk_num": 2},
+        {"start_percent": 0.70, "end_percent": 1.0, "chunk_num": 3},
+    ]
+    
+    chunks = []
+    
+    for boundary in chunk_boundaries:
+        start_time = boundary["start_percent"] * video_duration
+        target_end_time = boundary["end_percent"] * video_duration
+        
+        # Find the segment end closest to target_end_time
+        closest_segment_end = target_end_time
+        min_distance = float('inf')
+        
+        for seg in transcript_segments:
+            seg_end = seg.get("end", 0.0)
+            distance = abs(seg_end - target_end_time)
+            if distance < min_distance:
+                min_distance = distance
+                closest_segment_end = seg_end
+        
+        # Ensure chunk end doesn't exceed video duration
+        chunk_end = min(closest_segment_end, video_duration)
+        
+        # Collect all segments that fall within this chunk
+        chunk_text_parts = []
+        for seg in transcript_segments:
+            seg_start = seg.get("start", 0.0)
+            seg_end = seg.get("end", seg_start)
+            
+            # Include segment if it overlaps with chunk
+            if seg_start < chunk_end and seg_end > start_time:
+                chunk_text_parts.append(seg.get("text", "").strip())
+        
+        chunk_text = " ".join(chunk_text_parts).strip()
+        
+        if chunk_text:  # Only add non-empty chunks
+            chunks.append({
+                "chunk_num": boundary["chunk_num"],
+                "text": chunk_text,
+                "start": start_time,
+                "end": chunk_end,
+                "target_end_percent": boundary["end_percent"]
+            })
+    
+    return chunks
+
+def generate_mcqs_from_chunk_groq(chunk_text: str, chunk_num: int, question_count: int) -> List[Dict[str, Any]]:
+    """
+    Generate MCQs from a topic chunk using Groq API (fast).
+    
+    Args:
+        chunk_text: Transcript text for this chunk
+        chunk_num: Chunk number (1, 2, or 3)
+        question_count: Number of questions to generate (2 for chunks 1-2, 1 for chunk 3)
+        
+    Returns:
+        List of question dictionaries
+    """
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY not configured. Set GROQ_API_KEY environment variable.")
+    
+    try:
+        import requests
+    except ImportError:
+        raise RuntimeError("requests library not installed. Install with: pip install requests")
+    
+    if not chunk_text or len(chunk_text.strip()) < 50:
+        print(f"   ⚠️ Chunk {chunk_num}: Text too short ({len(chunk_text)} chars), skipping...")
+        return []
+    
+    prompt = f"""Generate EXACTLY {question_count} multiple-choice question(s) in ENGLISH ONLY from this video transcript chunk.
+
+TRANSCRIPT CHUNK:
+{chunk_text}
+
+REQUIREMENTS:
+1. Generate EXACTLY {question_count} question(s)
+2. Questions must be answerable from the transcript chunk provided
+3. Use formal exam language (no slang, no casual phrases)
+4. Each question must have exactly 4 options (A, B, C, D)
+5. One option must be clearly correct
+6. Other options must be plausible but incorrect
+
+OUTPUT FORMAT (JSON):
+{{
+  "questions": [
+    {{
+      "question": "What is the main concept explained in this chunk?",
+      "options": {{
+        "A": "Option A text",
+        "B": "Option B text",
+        "C": "Option C text",
+        "D": "Option D text"
+      }},
+      "correct_answer": "A"
+    }}
+  ]
+}}
+
+Generate {question_count} question(s) now:"""
+    
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "model": GROQ_MODEL,
+        "temperature": 0.3,
+        "max_tokens": 2000
+    }
+    
+    try:
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        content = result["choices"][0]["message"]["content"].strip()
+        
+        # Extract JSON from response
+        data = safe_json_extract(content)
+        
+        questions = []
+        if "questions" in data and isinstance(data["questions"], list):
+            for q in data["questions"]:
+                if isinstance(q, dict) and "question" in q and "options" in q:
+                    question_text = (q.get("question") or "").strip()
+                    options = q.get("options") or {}
+                    correct_answer = (q.get("correct_answer") or "").strip().upper()
+                    
+                    if question_text and isinstance(options, dict) and correct_answer in ["A", "B", "C", "D"]:
+                        # Normalize options
+                        normalized_options = {}
+                        for key in ["A", "B", "C", "D"]:
+                            opt_text = str(options.get(key, "")).strip()
+                            if opt_text:
+                                normalized_options[key] = opt_text
+                        
+                        if len(normalized_options) == 4:
+                            questions.append({
+                                "question": question_text,
+                                "options": normalized_options,
+                                "correct_answer": correct_answer,
+                                "chunk_num": chunk_num
+                            })
+        
+        return questions[:question_count]  # Return only requested count
+        
+    except Exception as e:
+        print(f"⚠️ Groq API error for chunk {chunk_num}: {e}")
+        return []
+
+def generate_mcqs_from_topic_chunks(transcript_segments: List[Dict[str, Any]], video_duration: float) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Generate 5 questions from 3 topic chunks using Groq.
+    
+    Strategy:
+    - Chunk 1 (0-35%): Generate 2 questions → Q1, Q2
+    - Chunk 2 (35-70%): Generate 2 questions → Q3, Q4
+    - Chunk 3 (70-100%): Generate 1 question → Q5
+    
+    Questions are timed at chunk ends (topic boundaries).
+    
+    Args:
+        transcript_segments: List of Whisper segments with timestamps
+        video_duration: Total video duration in seconds
+        
+    Returns:
+        (questions_list, chunk_metadata_list)
+    """
+    # Build 3 topic chunks
+    chunks = build_topic_chunks(transcript_segments, video_duration)
+    
+    if len(chunks) < 3:
+        raise RuntimeError(f"Failed to build 3 topic chunks. Got {len(chunks)} chunks.")
+    
+    all_questions = []
+    chunk_metadata = []
+    
+    # Question counts per chunk: [2, 2, 1] = 5 total
+    question_counts = [2, 2, 1]
+    
+    for idx, chunk in enumerate(chunks):
+        chunk_num = chunk["chunk_num"]
+        chunk_text = chunk["text"]
+        chunk_end = chunk["end"]
+        question_count = question_counts[idx]
+        
+        print(f"   📦 Chunk {chunk_num} ({chunk['start']:.1f}s - {chunk_end:.1f}s): Generating {question_count} question(s)...")
+        
+        # Generate questions from this chunk
+        chunk_questions = generate_mcqs_from_chunk_groq(chunk_text, chunk_num, question_count)
+        
+        if not chunk_questions:
+            print(f"   ⚠️ Chunk {chunk_num}: Failed to generate questions, skipping...")
+            continue
+        
+        # Set timestamps: questions appear at chunk end (topic boundary)
+        # For last chunk (chunk 3), ensure it's at least (video_duration - 2)
+        if chunk_num == 3:
+            chunk_end = max(chunk_end, video_duration - 2.0)
+        
+        for q_idx, q in enumerate(chunk_questions):
+            # All questions from same chunk share the same timestamp (chunk end)
+            q["timestamp_seconds"] = round(chunk_end, 2)
+            q["timestamp"] = seconds_to_mmss(chunk_end)
+            q["batch_number"] = chunk_num  # Batch number matches chunk number
+            q["anchor_type"] = "TOPIC_CHUNK"  # Mark as topic-chunk based
+            
+            # Calculate question index (1-5)
+            question_index = sum(question_counts[:idx]) + q_idx + 1
+            q["question_index"] = question_index
+        
+        all_questions.extend(chunk_questions)
+        
+        # Store chunk metadata
+        chunk_metadata.append({
+            "chunk_num": chunk_num,
+            "start": chunk["start"],
+            "end": chunk_end,
+            "target_end_percent": chunk["target_end_percent"],
+            "questions_generated": len(chunk_questions),
+            "text_preview": chunk_text[:100] + "..." if len(chunk_text) > 100 else chunk_text
+        })
+        
+        print(f"   ✅ Chunk {chunk_num}: Generated {len(chunk_questions)} question(s) at {chunk_end:.1f}s")
+    
+    # Ensure we have exactly 5 questions
+    if len(all_questions) < 5:
+        print(f"   ⚠️ Warning: Only generated {len(all_questions)} questions (target: 5)")
+    
+    # Sort by question index to ensure order
+    all_questions.sort(key=lambda q: q.get("question_index", 0))
+    
+    return all_questions[:5], chunk_metadata
 
 # ===============================
 # REQUEST MODELS
@@ -1443,7 +1729,7 @@ def validate_mcq_quality(question: Dict[str, Any], anchor: Dict[str, Any], conte
     """
     question_text = question.get("question", "").strip()
     options = question.get("options", {})
-    anchor_type = anchor.get("type", "UNKNOWN")
+    anchor_type = validate_anchor_type(anchor.get("type", "UNKNOWN"))
     
     # Check 1: Question text exists
     if not question_text or len(question_text) < 20:
@@ -1678,7 +1964,7 @@ def generate_topic_title(anchor: Dict[str, Any]) -> str:
     """
     text = anchor.get("text", "")
     if not text:
-        anchor_type = anchor.get("type", "UNKNOWN")
+        anchor_type = validate_anchor_type(anchor.get("type", "UNKNOWN"))
         return f"{anchor_type.title()} Concept"
     
     # Extract meaningful words (3+ characters, alphabetic)
@@ -1689,7 +1975,7 @@ def generate_topic_title(anchor: Dict[str, Any]) -> str:
     
     if not title_words:
         # Fallback to anchor type if no words found
-        anchor_type = anchor.get("type", "UNKNOWN")
+        anchor_type = validate_anchor_type(anchor.get("type", "UNKNOWN"))
         return f"{anchor_type.title()} Concept"
     
     # Join and title-case (e.g., "Rest Api Request Lifecycle")
@@ -1756,7 +2042,7 @@ def pick_anchors_with_quota(anchors: List[Dict[str, Any]]) -> List[Dict[str, Any
     # Group anchors by type
     grouped = defaultdict(list)
     for anchor in anchors:
-        anchor_type = anchor.get("type", "UNKNOWN")
+        anchor_type = validate_anchor_type(anchor.get("type", "UNKNOWN"))
         if anchor_type in ANCHOR_QUOTAS:  # Only include quota-defined types
             grouped[anchor_type].append(anchor)
     
@@ -1872,7 +2158,7 @@ def mcq_prompt_from_anchor(anchor: Dict[str, Any], question_number: int = 1, var
     variant: 0 = first question type, 1 = second question type (for multi-question per anchor)
     subtype: Sub-question type for PROCESS/DECISION (e.g., "ORDER", "MISSING_STEP", "WHEN_TO_USE", "WHY_NOT_USE")
     """
-    anchor_type = anchor.get("type", "DEFAULT")
+    anchor_type = validate_anchor_type(anchor.get("type", "DEFAULT"))
     anchor_text_raw = anchor.get("text", "")
     # Sanitize anchor text before sending to LLM
     anchor_text = sanitize_anchor_text(anchor_text_raw)
@@ -1990,91 +2276,13 @@ CONTENT:
 
 Return JSON only:"""
 
+# Ollama function removed - using Groq API only
 def generate_mcqs_ollama_from_segments(segments: List[str]) -> List[Dict[str, Any]]:
-    if not OLLAMA_EXE:
-        raise RuntimeError("Ollama not found. Install Ollama and ensure `ollama` is on PATH.")
-
-    all_cleaned: List[Dict[str, Any]] = []
-    last_err = None
-    max_rounds = max(3, MAX_RETRIES * 2)
-
-    for round_idx in range(1, max_rounds + 1):
-        missing = MCQ_COUNT - len(all_cleaned)
-        if missing <= 0:
-            return all_cleaned[:MCQ_COUNT]
-
-        prompt = mcq_prompt_from_segments(segments, missing, start_index=len(all_cleaned) + 1)
-
-        try:
-            r = subprocess.run(
-                [OLLAMA_EXE, "run", OLLAMA_MODEL],
-                input=prompt.encode("utf-8"),
-                capture_output=True,
-                timeout=OLLAMA_TIMEOUT,
-            )
-
-            if r.returncode != 0:
-                last_err = f"Ollama returned code {r.returncode}: {r.stderr.decode('utf-8', errors='ignore')[:500]}"
-                continue
-
-            out = r.stdout.decode("utf-8", errors="ignore").strip()
-            data = safe_json_extract(out)
-            qs = data.get("questions", [])
-
-            if not isinstance(qs, list):
-                last_err = "Invalid JSON: `questions` is not a list"
-                continue
-
-            cleaned: List[Dict[str, Any]] = []
-            for q in qs:
-                if not isinstance(q, dict):
-                    continue
-
-                question_text = (q.get("question") or "").strip()
-                options = q.get("options") or {}
-                ca = (q.get("correct_answer") or "").strip().upper()
-
-                if isinstance(options, dict):
-                    options = {str(k).upper(): v for k, v in options.items()}
-
-                if not question_text or not isinstance(options, dict) or ca not in ["A", "B", "C", "D"]:
-                    continue
-                if not {"A", "B", "C", "D"}.issubset(set(options.keys())):
-                    continue
-                if not is_english(question_text):
-                    continue
-
-                optA = str(options.get("A", "")).strip()
-                optB = str(options.get("B", "")).strip()
-                optC = str(options.get("C", "")).strip()
-                optD = str(options.get("D", "")).strip()
-
-                if not all([optA, optB, optC, optD]):
-                    continue
-                if not (is_english(optA) and is_english(optB) and is_english(optC) and is_english(optD)):
-                    continue
-
-                cleaned.append({
-                    "question": question_text,
-                    "options": {"A": optA, "B": optB, "C": optC, "D": optD},
-                    "correct_answer": ca
-                })
-
-            all_cleaned.extend(cleaned)
-            all_cleaned = deduplicate_questions(all_cleaned)
-
-            if len(all_cleaned) >= MCQ_COUNT:
-                return all_cleaned[:MCQ_COUNT]
-
-            last_err = f"After round {round_idx}, have {len(all_cleaned)} valid MCQs, need {MCQ_COUNT}"
-            time.sleep(0.2 * round_idx)
-
-        except subprocess.TimeoutExpired:
-            last_err = f"Ollama timed out after {OLLAMA_TIMEOUT}s"
-        except Exception as e:
-            last_err = f"Ollama error: {e}"
-
-    raise RuntimeError(last_err or "Failed to generate MCQs")
+    """
+    REMOVED - Ollama no longer used.
+    This function is kept for backward compatibility but raises an error.
+    """
+    raise RuntimeError("Ollama removed. Use topic-chunk mode with Groq API instead.")
 
 def fill_with_legacy_mcqs(
     transcript: str,
@@ -2082,23 +2290,10 @@ def fill_with_legacy_mcqs(
     target_count: int
 ) -> List[Dict[str, Any]]:
     """
-    Fill remaining MCQs using legacy chunk-based generation.
-    
-    Production-grade fallback: Exam-grade first, legacy fill only if needed.
-    Still applies deduplication and basic validation.
-    
-    This ensures we always return target_count questions while maintaining
-    exam-grade integrity for anchor-based questions.
+    REMOVED - Legacy MCQ generation no longer supported.
+    Use topic-chunk mode with Groq API instead.
     """
-    needed = target_count - len(existing_questions)
-    if needed <= 0:
-        return existing_questions
-    
-    print(f"   📊 Filling {needed} remaining MCQs using legacy chunk-based generation...")
-    
-    # Generate legacy MCQs from important chunks
-    segments = pick_random_important_chunks(transcript)
-    legacy_mcqs = generate_mcqs_ollama_from_segments(segments)
+    raise RuntimeError("Legacy MCQ generation removed. Use topic-chunk mode with Groq API instead.")
     
     # Add legacy MCQs with deduplication
     for q in legacy_mcqs:
@@ -2260,8 +2455,8 @@ def generate_mcqs_ollama_from_anchors(anchors: List[Dict[str, Any]], video_durat
     
     Returns: (questions_list, anchor_metadata_list)
     """
-    if not OLLAMA_EXE:
-        raise RuntimeError("Ollama not found. Install Ollama and ensure `ollama` is on PATH.")
+    # Ollama removed - this function should not be called
+    raise RuntimeError("Ollama removed. Use topic-chunk mode with Groq API instead.")
     
     all_cleaned: List[Dict[str, Any]] = []
     anchor_metadata: List[Dict[str, Any]] = []
@@ -2290,7 +2485,7 @@ def generate_mcqs_ollama_from_anchors(anchors: List[Dict[str, Any]], video_durat
     # ✅ FIX 3: Calculate max possible questions based on anchor inventory
     anchor_type_counts = defaultdict(int)
     for anchor in anchors:
-        anchor_type = anchor.get("type", "DEFAULT")
+        anchor_type = validate_anchor_type(anchor.get("type", "DEFAULT"))
         anchor_type_counts[anchor_type] += 1
     
     MAX_POSSIBLE_MCQS = (
@@ -2339,7 +2534,7 @@ def generate_mcqs_ollama_from_anchors(anchors: List[Dict[str, Any]], video_durat
         topic_end_seconds = topic_end + TOPIC_END_DELAY  # Trigger time (topic end + delay)
         
         # ✅ FIX 1: Get question limit for this anchor type
-        anchor_type = anchor.get("type", "DEFAULT")
+        anchor_type = validate_anchor_type(anchor.get("type", "DEFAULT"))
         max_questions_this_anchor_type = QUESTIONS_PER_ANCHOR_TYPE.get(anchor_type, 1)
         
         # Calculate how many questions we still need
@@ -2402,12 +2597,8 @@ def generate_mcqs_ollama_from_anchors(anchors: List[Dict[str, Any]], video_durat
                 else:
                     prompt = base_prompt
                 try:
-                    r = subprocess.run(
-                        [OLLAMA_EXE, "run", OLLAMA_MODEL],
-                        input=prompt.encode("utf-8"),
-                        capture_output=True,
-                        timeout=OLLAMA_TIMEOUT,
-                    )
+                    # Ollama removed - this function should not be called
+                    raise RuntimeError("Ollama removed. Use topic-chunk mode with Groq API instead.")
                     
                     if r.returncode != 0:
                         retries += 1
@@ -2474,7 +2665,7 @@ def generate_mcqs_ollama_from_anchors(anchors: List[Dict[str, Any]], video_durat
                             "question": question_text,
                             "options": {"A": optA, "B": optB, "C": optC, "D": optD},
                             "correct_answer": ca,
-                            "anchor_type": anchor.get("type", "DEFAULT")  # Store anchor type for tracking
+                            "anchor_type": validate_anchor_type(anchor.get("type", "DEFAULT"))  # Store anchor type for tracking
                         }
                         
                         # Exam-grade quality validation
@@ -2517,7 +2708,7 @@ def generate_mcqs_ollama_from_anchors(anchors: List[Dict[str, Any]], video_durat
                         
                         # ✅ FIX 2: Hard semantic deduplication - compare with ALL accepted questions
                         if not is_duplicate:
-                            anchor_type_for_dedup = anchor.get("type", "DEFAULT")
+                            anchor_type_for_dedup = validate_anchor_type(anchor.get("type", "DEFAULT"))
                             
                             # ✅ FIX 2: Use stricter threshold for semantic deduplication (0.7 = 70% word overlap)
                             q_words = set(re.findall(r'\b\w+\b', question_text.lower()))
@@ -2612,7 +2803,7 @@ def generate_mcqs_ollama_from_anchors(anchors: List[Dict[str, Any]], video_durat
                             if questions_from_anchor == 1:  # Only store metadata for first question from this anchor
                                 anchor_meta = {
                                     "anchor_id": f"a_{idx:03d}",
-                                    "anchor_type": anchor.get("type", "DEFAULT"),
+                                    "anchor_type": validate_anchor_type(anchor.get("type", "DEFAULT")),
                                     "concept_summary": anchor.get("text", "")[:200],  # Truncate for storage
                                     "source": "video",
                                     "sentence_index": anchor.get("sentence_index", anchor.get("index", 0)),
@@ -2624,15 +2815,15 @@ def generate_mcqs_ollama_from_anchors(anchors: List[Dict[str, Any]], video_durat
                                         "max_seconds": 40
                                     },
                                     "question": {
-                                        "question_type": QUESTION_TYPE_MAP.get(anchor.get("type", "DEFAULT"), "recall"),
+                                        "question_type": QUESTION_TYPE_MAP.get(validate_anchor_type(anchor.get("type", "DEFAULT")), "recall"),
                                         "format": "mcq",
                                         "difficulty": "medium",  # Could be enhanced with actual difficulty detection
                                         "retry_variant_count": retries + 1,
                                         "questions_generated": 1  # Will be updated
                                     },
                                     "llm": {
-                                        "generator_model": OLLAMA_MODEL,
-                                        "critic_model": OLLAMA_MODEL,  # Same model used for both
+                                        "generator_model": GROQ_MODEL if USE_TOPIC_CHUNK_MODE else "removed",
+                                        "critic_model": GROQ_MODEL if USE_TOPIC_CHUNK_MODE else "removed",
                                         "generation_pass": 1
                                     }
                                 }
@@ -2715,6 +2906,12 @@ def generate_mcqs_from_video_fast(video_url: str, use_anchors: Optional[bool] = 
     """
     Main pipeline: Video → Transcript → Anchors → MCQs
     
+    Topic-Chunk mode (USE_TOPIC_CHUNK_MODE=True):
+    - 3 topic chunks (0-35%, 35-70%, 70-100%)
+    - 5 questions total (2+2+1)
+    - Questions timed at chunk ends (topic boundaries)
+    - Uses Groq API for fast generation
+    
     Exam-grade mode (use_anchors=True):
     - Anchor detection (rules-based, no LLM)
     - Pedagogy engine (question type control)
@@ -2732,162 +2929,22 @@ def generate_mcqs_from_video_fast(video_url: str, use_anchors: Optional[bool] = 
     
     transcript, transcript_segments, clip_timestamps, video_duration = transcribe_sampled_stream(video_url)
     
-    # ✅ CRITICAL FIX: Check segments first (source of truth), not word count
-    # Segments matter for exam-grade, words are derived
-    segment_count = len(transcript_segments)
-    if segment_count < 8:  # Minimum segments for exam-grade MCQs
-        word_count = len(transcript.split()) if transcript else 0
+    # ✅ TOPIC-CHUNK MODE: Fast 3-chunk → 5 questions approach (ONLY MODE)
+    if not USE_TOPIC_CHUNK_MODE:
         raise RuntimeError(
-            f"❌ Not enough speech segments for exam-grade MCQs: {segment_count} segments (minimum: 8). "
-            f"Found {word_count} words from {len(clip_timestamps)} clips. "
-            f"Video duration: {video_duration:.1f}s. "
-            f"This may indicate: (1) Video has very little speech, (2) Speech is too fragmented, "
-            f"(3) Audio quality issues. "
-            f"Suggestions: (1) Use videos with clear, continuous speech, (2) Check audio track quality, "
-            f"(3) Try increasing SAMPLE_CLIPS or CLIP_SECONDS."
+            "Topic-chunk mode disabled and Ollama removed. "
+            "Enable USE_TOPIC_CHUNK_MODE=true to use Groq API for question generation."
         )
     
-    # ✅ Secondary validation: Word count (for backward compatibility)
-    word_count = len(transcript.split()) if transcript else 0
-    min_words = required_min_words(video_duration)
-    if word_count < min_words:
-        # Warn but don't fail if we have segments
-        print(f"⚠️ Warning: Transcript has {word_count} words (below threshold {min_words}), but {segment_count} segments found. Proceeding with segments.")
+    print(f"📦 Topic-Chunk Mode: Building 3 chunks from {len(transcript_segments)} segments (duration: {video_duration:.1f}s)...")
     
-    # Also check character count as secondary validation
-    if len(transcript) < 200:
-        raise RuntimeError(
-            f"Transcript too short: {len(transcript)} characters (minimum: 200). "
-            f"Increase SAMPLE_CLIPS (current: {SAMPLE_CLIPS}) or CLIP_SECONDS (current: {CLIP_SECONDS})."
-        )
+    questions, chunk_metadata = generate_mcqs_from_topic_chunks(transcript_segments, video_duration)
     
-    if use_anchors:
-        # Exam-grade mode: Anchor detection from segments with exact timestamps
-        print(f"🔍 Exam-grade mode: Detecting anchors from segments with exact timestamps ({len(transcript_segments)} segments, duration: {video_duration:.1f}s)...")
-        
-        # ✅ STEP 3: Detect anchors from segments (exact timestamps)
-        anchors = detect_anchors_from_segments(transcript_segments)
-        
-        # ✅ FIX 4: Fail fast if insufficient anchors
-        if len(anchors) < 10:
-            raise RuntimeError(
-                f"❌ Not enough examinable anchors found: {len(anchors)} anchors (minimum: 10). "
-                f"Video is unsuitable for exam-grade MCQs. "
-                f"Video duration: {video_duration:.1f}s. "
-                f"Suggestions: (1) Use videos with clear educational content, (2) Ensure video has definitions, processes, and decision points, "
-                f"(3) Check if video has sufficient speech segments."
-            )
-        
-        # ✅ FIX 2: Use quota-based anchor selection (balanced coverage)
-        anchors = pick_anchors_with_quota(anchors)
-        
-        # ✅ STEP 4: Anchors already have exact timestamps from segments
-        # ✅ CRITICAL FIX: Build context from segments around anchor (not just anchor text)
-        # This ensures questions are answerable from specific video context, reducing "answerable without context" rejections by ~60-70%
-        for anchor in anchors:
-            anchor_start = anchor.get("start", 0.0)
-            anchor["timestamp_seconds"] = anchor_start  # Already exact from segment
-            anchor["timestamp"] = seconds_to_mmss(anchor_start)  # MM:SS format
-            anchor["timestamp_confidence"] = "exact"  # From Whisper segments
-            
-            # Build context from segments around anchor (24-second window)
-            anchor["context"] = build_context_from_segments(anchor, transcript_segments, window_seconds=24.0)
-        print(f"   Found {len(anchors)} anchors")
-        if len(anchors) == 0:
-            # ✅ FIX 4: Fail fast - no legacy fallback in exam-grade mode
-            raise RuntimeError(
-                f"❌ No examinable anchors detected in video. "
-                f"Video duration: {video_duration:.1f}s. "
-                f"This video is unsuitable for exam-grade MCQs. "
-                f"Use videos with clear educational content containing definitions, processes, decisions, etc."
-            )
-        # Show anchor types
-        anchor_types = {}
-        for a in anchors:
-            at = a.get("type", "UNKNOWN")
-            anchor_types[at] = anchor_types.get(at, 0) + 1
-        print(f"   Anchor types: {anchor_types}")
-        questions, anchor_metadata = generate_mcqs_ollama_from_anchors(anchors, video_duration=video_duration, transcript_segments=transcript_segments)
-        
-        # ✅ HYBRID MODE: 10 exam-grade + 10 legacy questions
-        # ✅ FIX 1: Respect ALLOW_LEGACY_FILL flag
-        if USE_HYBRID_MODE and ALLOW_LEGACY_FILL:
-            # Limit exam-grade questions to EXAM_GRADE_COUNT
-            exam_grade_questions = questions[:EXAM_GRADE_COUNT]
-            print(f"   ✅ Generated {len(exam_grade_questions)} exam-grade MCQs (target: {EXAM_GRADE_COUNT})")
-            
-            # Generate legacy questions to fill remaining
-            legacy_needed = LEGACY_COUNT
-            if len(exam_grade_questions) < EXAM_GRADE_COUNT:
-                legacy_needed = MCQ_COUNT - len(exam_grade_questions)
-            
-            print(f"   📊 Generating {legacy_needed} legacy/generic MCQs...")
-            segments = pick_random_important_chunks(transcript)
-            legacy_questions = generate_mcqs_ollama_from_segments(segments)
-            
-            # Take only needed legacy questions and mark them
-            legacy_questions = legacy_questions[:legacy_needed]
-            
-            # ✅ Add timestamps to legacy questions (distribute evenly across full video)
-            for idx, q in enumerate(legacy_questions):
-                q["anchor_type"] = "LEGACY"  # Mark as legacy
-                # Distribute legacy questions evenly across full video (0% to 100%)
-                timestamp_seconds = (idx / max(legacy_needed - 1, 1)) * video_duration if video_duration > 0 and legacy_needed > 1 else (idx * video_duration / max(legacy_needed, 1))
-                q["timestamp_seconds"] = round(timestamp_seconds, 2)
-                q["timestamp"] = seconds_to_mmss(timestamp_seconds)  # MM:SS format
-            
-            # Combine: exam-grade first, then legacy
-            all_questions = exam_grade_questions + legacy_questions
-            print(f"   ✅ Total: {len(exam_grade_questions)} exam-grade + {len(legacy_questions)} legacy = {len(all_questions)} MCQs")
-            
-            return all_questions[:MCQ_COUNT], anchor_metadata
-        
-        # ✅ PURE EXAM-GRADE MODE: No legacy fill, no padding, no mixing
-        # If exam-grade < MCQ_COUNT → return fewer questions (academically correct)
-        if len(questions) < MCQ_COUNT:
-            print(f"   ⚠️ Only {len(questions)} exam-grade MCQs possible from this video (required: {MCQ_COUNT})")
-            print(f"   ℹ️ Returning {len(questions)} exam-grade MCQs (no legacy padding)")
-        
-        # ✅ FIX 5: Remove legacy questions (hard rule - no legacy in exam-grade output)
-        questions = [
-            q for q in questions
-            if q.get("anchor_type") not in {"LEGACY", "UNKNOWN", None}
-        ]
-        
-        # CRITICAL: Validate no legacy contamination
-        for q in questions:
-            anchor_type = q.get("anchor_type", "UNKNOWN")
-            if anchor_type not in {"PROCESS", "DECISION", "DEFINITION", "RISK", "BOUNDARY", "COMPARISON"}:
-                raise RuntimeError(f"Invalid anchor_type '{anchor_type}' detected in exam-grade output")
-        
-        return questions[:MCQ_COUNT], anchor_metadata
-    else:
-        # Legacy mode: Random chunks
-        segments = pick_random_important_chunks(transcript)
-        questions = generate_mcqs_ollama_from_segments(segments)
-        
-        # ✅ Add timestamps to legacy questions (timestamp window, not exact)
-        for idx, q in enumerate(questions):
-            # Use clip timestamps if available, otherwise distribute evenly
-            if clip_timestamps and len(clip_timestamps) > 0:
-                clip_idx = min(int((idx / max(len(questions) - 1, 1)) * len(clip_timestamps)), len(clip_timestamps) - 1)
-                clip_start = clip_timestamps[clip_idx]
-                clip_end = clip_start + CLIP_SECONDS
-            else:
-                clip_start = (idx / max(len(questions) - 1, 1)) * video_duration if video_duration > 0 and len(questions) > 1 else (idx * video_duration / max(len(questions), 1))
-                clip_end = clip_start + CLIP_SECONDS
-            
-            q["timestamp_seconds"] = round(clip_start, 2)  # Approximate
-            q["timestamp"] = seconds_to_mmss(clip_start)  # MM:SS format
-            q["timestamp_confidence"] = "approx"  # From clip, not exact segment
-            q["timestamp_window"] = {
-                "start": round(clip_start, 2),
-                "end": round(min(video_duration, clip_end), 2),
-                "confidence": "approx",
-                "source": "ffmpeg_clip"
-            }
-        
-        return questions, None
+    # Last question timing is already handled in generate_mcqs_from_topic_chunks
+    # (chunk 3 ensures max(T3, video_duration - 2))
+    
+    print(f"   ✅ Generated {len(questions)} questions from 3 topic chunks")
+    return questions, chunk_metadata
 
 # ===============================
 # QUALITY METRICS BUILDER (Exam-Grade)
@@ -2927,7 +2984,7 @@ def build_quality_metrics(anchor_metadata: Optional[List[Dict[str, Any]]],
     # Add anchor distribution for quick stats
     anchor_distribution = {}
     for anchor in anchor_metadata:
-        anchor_type = anchor.get("anchor_type", "UNKNOWN")
+        anchor_type = validate_anchor_type(anchor.get("anchor_type", "UNKNOWN"))
         anchor_distribution[anchor_type] = anchor_distribution.get(anchor_type, 0) + 1
     quality_metrics["generation_summary"]["anchor_distribution"] = anchor_distribution
     
@@ -2969,7 +3026,7 @@ async def db_upsert(session: AsyncSession, video_id: str, url: str, questions: l
     generator = {
         "mode": mode,  # Cache versioning key
         "whisper_model": WHISPER_MODEL_SIZE,
-        "ollama_model": OLLAMA_MODEL,
+        "groq_model": GROQ_MODEL if USE_TOPIC_CHUNK_MODE else None,
         "sample_clips": SAMPLE_CLIPS,
         "clip_seconds": CLIP_SECONDS,
         "validation_rule_version": VALIDATION_RULE_VERSION,  # Cache invalidation when rules change
@@ -3360,23 +3417,28 @@ async def get_mcqs(request: MCQRequest):
                     except:
                         pass
             
-            # ✅ HYBRID MODE: Allow legacy in hybrid mode, but validate in pure exam-grade mode
-            if not USE_HYBRID_MODE:
-                # Pure exam-grade mode: NO legacy contamination
-                if current_mode == "exam-grade" and any(q.get("anchor_type") == "LEGACY" for q in qs):
-                    raise RuntimeError("Legacy MCQs are not allowed in pure exam-grade mode")
-                
-                # CRITICAL: Validate all questions have valid anchor types in pure exam-grade mode
-                if current_mode == "exam-grade":
-                    for q in qs:
-                        anchor_type = q.get("anchor_type", "UNKNOWN")
-                        if anchor_type not in {"PROCESS", "DECISION", "DEFINITION", "RISK", "BOUNDARY", "COMPARISON"}:
-                            raise RuntimeError(f"Invalid anchor_type '{anchor_type}' detected in exam-grade output")
+            # ✅ Validate all questions have valid anchor types (using ALLOWED_ANCHORS)
+            # Ensure all questions have a valid anchor_type, defaulting missing ones to TOPIC_CHUNK for topic-chunk mode
+            for q in qs:
+                anchor_type = q.get("anchor_type")
+                if not anchor_type or anchor_type not in ALLOWED_ANCHORS:
+                    # Validate and coerce invalid types (or set default for topic-chunk mode)
+                    if USE_TOPIC_CHUNK_MODE and not anchor_type:
+                        # Default to TOPIC_CHUNK for topic-chunk mode if missing
+                        q["anchor_type"] = "TOPIC_CHUNK"
+                    else:
+                        # Coerce invalid types to PROCESS
+                        validated_type = validate_anchor_type(anchor_type or "UNKNOWN")
+                        q["anchor_type"] = validated_type
             
             # Detect actual mode from generated questions
-            detected_mode = "legacy"
+            detected_mode = "topic-chunk"  # Default for topic-chunk mode
             if anchor_metadata:
-                detected_mode = "exam-grade"
+                # Check if we have topic-chunk questions
+                if any(q.get("anchor_type") == "TOPIC_CHUNK" for q in qs):
+                    detected_mode = "topic-chunk"
+                else:
+                    detected_mode = "exam-grade"  # Fallback for old cached data
             
             # Build complete quality_metrics
             generation_time = time.time() - t0
@@ -3494,10 +3556,10 @@ async def fetch_mcqs_by_url(url: str = Query(...), req: FetchByUrlRequest = Fetc
 @app.get("/health")
 def health():
     return {
-        "status": "ready" if OLLAMA_EXE else "warning",
-        "ollama_available": bool(OLLAMA_EXE),
+        "status": "ready",
         "whisper_model": WHISPER_MODEL_SIZE,
-        "ollama_model": OLLAMA_MODEL,
+        "groq_model": GROQ_MODEL if USE_TOPIC_CHUNK_MODE else None,
+        "topic_chunk_mode": USE_TOPIC_CHUNK_MODE,
         "db_configured": bool(DATABASE_URL),
         "mcq_count": MCQ_COUNT,
         "sample_clips": SAMPLE_CLIPS,

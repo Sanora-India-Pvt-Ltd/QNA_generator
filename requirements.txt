@@ -1,8 +1,22 @@
+# Web Framework
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
+
+# Database (MySQL Async Driver)
 sqlalchemy>=2.0.0
 aiomysql>=0.2.0
+
+# Data Validation & Models
 pydantic>=2.0.0
+
+# Audio Processing & Transcription
 numpy>=1.24.0
 faster-whisper>=0.10.0
+
+# HTTP Client (for Groq API)
+requests>=2.31.0
+
+# System Dependencies (usually pre-installed, but listed for completeness)
+# - ffmpeg/ffprobe (must be installed separately via system package manager)
+# - Groq API access (via GROQ_API_KEY environment variable)
 
