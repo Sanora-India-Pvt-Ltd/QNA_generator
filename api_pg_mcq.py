@@ -1,4 +1,4 @@
-
+ 
 
 import os
 import re
@@ -10,11 +10,41 @@ import random
 import hashlib
 import subprocess
 import traceback
+import asyncio
+import base64
 from collections import defaultdict
 from typing import List, Dict, Any, Optional, Tuple
 
+# ✅ Load environment variables from .env file if it exists
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    print("✅ Loaded environment variables from .env file (if present)")
+except ImportError:
+    print("⚠️ python-dotenv not installed. Install with: pip install python-dotenv")
+    print("   Environment variables must be set manually or via system environment")
+except Exception as e:
+    print(f"⚠️ Error loading .env file: {e}")
+
+# ✅ FIX #4: Application-level locks to prevent concurrent processing of same video_id
+VIDEO_LOCKS: Dict[str, asyncio.Lock] = {}
+
+def get_video_lock(video_id: str) -> asyncio.Lock:
+    """Get or create a lock for a specific video_id to prevent concurrent processing"""
+    if video_id not in VIDEO_LOCKS:
+        VIDEO_LOCKS[video_id] = asyncio.Lock()
+    return VIDEO_LOCKS[video_id]
+
 import numpy as np
 from faster_whisper import WhisperModel
+
+# OpenAI SDK for article synthesis
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+    print("⚠️ OpenAI SDK not installed. Install with: pip install openai")
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,9 +52,19 @@ from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field
 
 from sqlalchemy import String, Text, Integer, BigInteger, func, select, TIMESTAMP
-from sqlalchemy.dialects.mysql import JSON
+from sqlalchemy.dialects.mysql import JSON, insert
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.exc import OperationalError
+
+# MongoDB imports for product endpoints
+try:
+    from motor.motor_asyncio import AsyncIOMotorClient
+    from bson import ObjectId
+    MONGO_AVAILABLE = True
+except ImportError:
+    MONGO_AVAILABLE = False
+    print("⚠️ MongoDB libraries not installed. Product endpoints will be disabled. Install with: pip install motor pymongo")
 
 # ===============================
 # CONFIG
@@ -84,8 +124,42 @@ TOPIC_END_DELAY = float(os.getenv("TOPIC_END_DELAY", "0.8"))  # seconds
 
 # Topic-Chunk Mode: Use 3 chunks for 5 questions (fast, deterministic)
 USE_TOPIC_CHUNK_MODE = os.getenv("USE_TOPIC_CHUNK_MODE", "false").lower() == "true"
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()  # Strip whitespace
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")  # Fast model for question generation
+
+# ✅ Validate GROQ_API_KEY on startup
+if GROQ_API_KEY:
+    print(f"✅ GROQ_API_KEY loaded (length: {len(GROQ_API_KEY)}, starts with: {GROQ_API_KEY[:5]}...)")
+else:
+    print("⚠️ GROQ_API_KEY is empty or not set. Content safety classification will fail.")
+    print("   Set it with: $env:GROQ_API_KEY='your_key_here' (PowerShell) or export GROQ_API_KEY='your_key_here' (Linux/Mac)")
+
+# OpenAI Configuration for Article Synthesis
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # Default model for article synthesis
+
+# MongoDB Configuration for Product Endpoints
+MONGO_URI = os.getenv("MONGO_URI", "")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "sanora")
+MONGO_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "products")
+
+# MongoDB connection (lazy initialization)
+mongo_client = None
+products_collection = None
+if MONGO_AVAILABLE and MONGO_URI:
+    try:
+        mongo_client = AsyncIOMotorClient(MONGO_URI)
+        db = mongo_client[MONGO_DB_NAME]
+        products_collection = db[MONGO_COLLECTION_NAME]
+        print(f"✅ MongoDB connected: {MONGO_DB_NAME}.{MONGO_COLLECTION_NAME}")
+    except Exception as e:
+        print(f"⚠️ MongoDB connection failed: {e}")
+        mongo_client = None
+        products_collection = None
+elif not MONGO_AVAILABLE:
+    print("⚠️ MongoDB libraries not available. Product endpoints disabled.")
+elif not MONGO_URI:
+    print("⚠️ MONGO_URI not configured. Product endpoints disabled.")
 
 # Legacy Fill Mode - Allow filling remaining MCQs with legacy chunks if exam-grade generation < target
 # Set ALLOW_LEGACY_FILL=false for strict exam-grade mode (may return < 20 questions)
@@ -100,7 +174,8 @@ ALLOWED_ANCHORS = {
     "ADVANTAGE",
     "RISK",
     "DECISION",
-    "TOPIC_CHUNK"  # Topic-chunk based questions
+    "TOPIC_CHUNK",  # Topic-chunk based questions
+    "WEB_SEARCH"  # Web search based questions (generated at video end)
 }
 
 # Print mode on startup for debugging
@@ -114,6 +189,1005 @@ print(f"📹 SAMPLE_CLIPS = {SAMPLE_CLIPS}, CLIP_SECONDS = {CLIP_SECONDS} (Total
 print(f"📝 MIN_TRANSCRIPT_WORDS = {MIN_TRANSCRIPT_WORDS} (Quality gate)")
 print(f"⏱️ FFPROBE_TIMEOUT = {FFPROBE_TIMEOUT}s, FFPROBE_RETRIES = {FFPROBE_RETRIES} (Video metadata)")
 print(f"🎬 FFMPEG_TIMEOUT = {FFMPEG_TIMEOUT_PER_CLIP}s, FFMPEG_RETRIES = {FFMPEG_RETRIES} (Clip extraction)")
+
+# ===============================
+# CONTENT SAFETY CLASSIFICATION FOR EDUCATIONAL VIDEOS
+# ===============================
+"""
+Content Safety Classification for Educational Videos
+
+This module provides prompts and utilities for classifying video frames
+for content safety in educational applications.
+"""
+
+# PROMPT A - Single Video Frame Safety Check (Groq Llama Guard 4)
+PROMPT_A_SYSTEM = """You are a strict content safety classifier for an educational app.
+
+Classify the provided VIDEO FRAME image as SAFE, UNSAFE, or UNCERTAIN.
+
+UNSAFE if the frame contains any of:
+- explicit sexual content or nudity
+- graphic violence or gore
+- self-harm depiction
+- hate symbols or extremist imagery
+- depiction of illegal activity (weapons handling for harm, drugs, etc.)
+
+UNCERTAIN if the frame is too blurry/dark/low-resolution to judge safely.
+
+Return ONLY valid JSON. No extra text."""
+
+def get_prompt_a_user(timestamp_seconds: float, frame_id: str) -> str:
+    """
+    Generate the user prompt for single frame classification.
+    
+    Args:
+        timestamp_seconds: Timestamp of the frame in seconds
+        frame_id: Unique identifier for the frame
+        
+    Returns:
+        User prompt string
+    """
+    return f"""Classify this single video frame for safety.
+
+Context:
+- timestamp_seconds: {timestamp_seconds}
+- frame_id: {frame_id}
+- product: general-audience educational app
+
+Return JSON exactly:
+
+{{
+  "verdict": "SAFE" | "UNSAFE" | "UNCERTAIN",
+  "category": "safe | sexual_nudity | sexual_explicit | violence_gore | self_harm | hate_symbol | illegal_activity | unknown",
+  "confidence": 0.0,
+  "reason": "max 12 words"
+}}"""
+
+
+# PROMPT B - Batch / Frame Set Safety Check (UPDATED)
+PROMPT_B_SYSTEM = """You are a strict content safety classifier for an educational app.
+
+You will receive multiple video frame images with frame_id and timestamp.
+
+For each frame:
+- classify SAFE, UNSAFE, or UNCERTAIN
+- explicitly mark whether it is safe or unsafe
+
+Overall video verdict:
+- UNSAFE if any frame is UNSAFE with confidence >= 0.70
+- UNCERTAIN if no UNSAFE but at least one UNCERTAIN
+- SAFE only if all frames are SAFE
+
+Return ONLY valid JSON. No extra text."""
+
+def get_prompt_b_user(frames: List[Dict[str, Any]]) -> str:
+    """
+    Generate the user prompt for batch frame classification.
+    
+    Args:
+        frames: List of frame dictionaries with 'frame_id' and 'timestamp_seconds'
+                Example: [{"frame_id": "id1", "timestamp_seconds": 1.5}, ...]
+        
+    Returns:
+        User prompt string
+    """
+    frames_json = json.dumps(frames, indent=2)
+    
+    return f"""Classify each frame for safety and also give an overall video verdict.
+
+Frames included (each image is provided with the matching frame_id):
+{frames_json}
+
+Return JSON exactly like this:
+
+{{
+  "overall_video_verdict": "SAFE" | "UNSAFE" | "UNCERTAIN",
+  "overall_is_safe": false,
+  "overall_is_unsafe": false,
+  "overall_reason": "short reason (max 12 words)",
+  "frames": [
+    {{
+      "frame_id": "string",
+      "timestamp_seconds": 0.0,
+      "verdict": "SAFE" | "UNSAFE" | "UNCERTAIN",
+      "is_safe": true,
+      "is_unsafe": false,
+      "category": "safe | sexual_nudity | sexual_explicit | violence_gore | self_harm | hate_symbol | illegal_activity | unknown",
+      "confidence": 0.0,
+      "flags": {{
+        "nudity": false,
+        "explicit_sexual": false,
+        "gore": false,
+        "self_harm": false,
+        "hate_symbol": false,
+        "illegal_activity": false
+      }}
+    }}
+  ]
+}}"""
+
+
+def parse_single_frame_response(response_text: str) -> Dict[str, Any]:
+    """
+    Parse the JSON response from single frame classification.
+    
+    Args:
+        response_text: Raw response text from the model
+        
+    Returns:
+        Parsed dictionary with classification results
+    """
+    if not response_text or not response_text.strip():
+        raise ValueError("Empty response text")
+    
+    try:
+        # Try to extract JSON from response (in case there's extra text)
+        text = response_text.strip()
+        
+        # Remove markdown code blocks if present
+        if text.startswith("```json"):
+            text = text[7:]
+        elif text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+        
+        # Try direct JSON parse first
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # Try to find JSON object in the text
+            json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group(0))
+            else:
+                raise ValueError(f"No valid JSON found in response: {repr(text[:200])}")
+                
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse JSON response: {e}. Raw text: {repr(response_text[:200])}")
+
+
+def parse_batch_frame_response(response_text: str) -> Dict[str, Any]:
+    """
+    Parse the JSON response from batch frame classification.
+    
+    Args:
+        response_text: Raw response text from the model
+        
+    Returns:
+        Parsed dictionary with classification results
+    """
+    try:
+        # Try to extract JSON from response (in case there's extra text)
+        response_text = response_text.strip()
+        if response_text.startswith("```json"):
+            response_text = response_text[7:]
+        if response_text.startswith("```"):
+            response_text = response_text[3:]
+        if response_text.endswith("```"):
+            response_text = response_text[:-3]
+        response_text = response_text.strip()
+        
+        return json.loads(response_text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse JSON response: {e}")
+
+
+def should_mark_video_unsafe(frame_result: Dict[str, Any], confidence_threshold: float = 0.70) -> bool:
+    """
+    Determine if a single frame result should mark the video as unsafe.
+    
+    Args:
+        frame_result: Single frame classification result
+        confidence_threshold: Minimum confidence for UNSAFE verdict (default: 0.70)
+        
+    Returns:
+        True if video should be marked unsafe
+    """
+    verdict = frame_result.get("verdict", "").upper()
+    confidence = frame_result.get("confidence", 0.0)
+    
+    return verdict == "UNSAFE" and confidence >= confidence_threshold
+
+
+def get_overall_verdict_from_batch(batch_result: Dict[str, Any]) -> str:
+    """
+    Extract overall video verdict from batch classification result.
+    
+    Args:
+        batch_result: Batch frame classification result
+        
+    Returns:
+        Overall verdict: "SAFE", "UNSAFE", or "UNCERTAIN"
+    """
+    return batch_result.get("overall_video_verdict", "UNCERTAIN").upper()
+
+
+def get_unsafe_frames(batch_result: Dict[str, Any], confidence_threshold: float = 0.70) -> List[Dict[str, Any]]:
+    """
+    Extract all unsafe frames from batch classification result.
+    
+    Args:
+        batch_result: Batch frame classification result
+        confidence_threshold: Minimum confidence for UNSAFE verdict (default: 0.70)
+        
+    Returns:
+        List of unsafe frame results
+    """
+    frames = batch_result.get("frames", [])
+    unsafe_frames = []
+    
+    for frame in frames:
+        verdict = frame.get("verdict", "").upper()
+        confidence = frame.get("confidence", 0.0)
+        
+        if verdict == "UNSAFE" and confidence >= confidence_threshold:
+            unsafe_frames.append(frame)
+    
+    return unsafe_frames
+
+
+# ===============================
+# CONTENT SAFETY CLASSIFICATION IMPLEMENTATION
+# ===============================
+
+# ✅ Groq Llama Guard 4 Frame Classification (Robust JSON Parsing)
+GUARD_MODEL = "meta-llama/llama-guard-4-12b"
+
+GUARD_SYSTEM_PROMPT = (
+    "You are a strict content safety classifier for an educational app. "
+    "Reply with ONLY ONE WORD: SAFE, UNSAFE, or UNCERTAIN. "
+    "No JSON. No markdown. No code fences. No extra text."
+)
+
+def make_guard_user_text(ts: float, frame_id: str) -> str:
+    """
+    Generate user prompt text for frame safety classification.
+    Asks for ONE WORD only (no JSON) to avoid JSON validation errors.
+    """
+    return f"""Classify this single video frame image for safety.
+
+UNSAFE if it contains: explicit sexual content/nudity, graphic violence/gore, self-harm depiction, hate symbols, or depiction of illegal activity.
+UNCERTAIN if the image is too blurry/dark/low-quality to judge.
+
+Context: timestamp_seconds={ts}, frame_id={frame_id}
+"""
+
+def _fallback_from_raw_text(raw: str) -> Dict[str, Any]:
+    """
+    If model returns plain text like 'SAFE' or 'UNSAFE', convert to dict.
+    """
+    low = (raw or "").strip().lower()
+    if not low:
+        return {"verdict": "UNCERTAIN", "category": "unknown", "confidence": 0.0, "reason": "Empty model response"}
+
+    if "unsafe" in low:
+        return {"verdict": "UNSAFE", "category": "unknown", "confidence": 0.7, "reason": "Model marked unsafe"}
+    if "safe" in low:
+        return {"verdict": "SAFE", "category": "safe", "confidence": 0.7, "reason": "Model marked safe"}
+
+    return {"verdict": "UNCERTAIN", "category": "unknown", "confidence": 0.0, "reason": "Non-JSON response"}
+
+def _parse_json_safely(raw: str) -> Dict[str, Any]:
+    """
+    Try strict JSON, then try to extract JSON object substring, then fallback.
+    """
+    if not raw or not raw.strip():
+        return _fallback_from_raw_text(raw)
+
+    raw = raw.strip()
+
+    # 1) strict parse
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and "verdict" in data:
+            return data
+    except Exception:
+        pass
+
+    # 2) extract {...} substring
+    m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+    if m:
+        try:
+            data = json.loads(m.group(0))
+            if isinstance(data, dict) and "verdict" in data:
+                return data
+        except Exception:
+            pass
+
+    # 3) fallback from text
+    return _fallback_from_raw_text(raw)
+
+def classify_frame_safety_groq(client, image_url: str, ts: float, frame_id: str) -> Dict[str, Any]:
+    """
+    Classify a single frame using Groq Llama Guard 4.
+    Asks for ONE WORD response (SAFE/UNSAFE/UNCERTAIN) and builds JSON ourselves.
+    This avoids JSON validation errors that occur when forcing JSON mode.
+    
+    Args:
+        client: OpenAI client configured for Groq
+        image_url: Base64 data URL or image URL
+        ts: Timestamp in seconds
+        frame_id: Frame identifier
+        
+    Returns:
+        Dictionary with verdict, category, confidence, reason, frame_id, timestamp_seconds
+    """
+    # ✅ Validate client has valid API key before making request
+    if not client or not hasattr(client, 'api_key') or not client.api_key:
+        raise ValueError("Groq client has no API key configured")
+    
+    resp = client.chat.completions.create(
+        model=GUARD_MODEL,
+        temperature=0,
+        # ✅ NO response_format - let model return simple word, we build JSON
+        messages=[
+            {"role": "system", "content": GUARD_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": make_guard_user_text(ts, frame_id)},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            },
+        ],
+    )
+
+    raw = (resp.choices[0].message.content or "").strip().upper()
+    
+    # Debug: show what model actually returned
+    print(f"   📋 RAW GUARD OUTPUT for {frame_id}: {repr(raw)}")
+
+    # Take first token only (guards against extra whitespace/text)
+    verdict = raw.split()[0] if raw else "UNCERTAIN"
+    if verdict not in ("SAFE", "UNSAFE", "UNCERTAIN"):
+        verdict = "UNCERTAIN"
+
+    # Map category based on verdict (can enhance later with more sophisticated mapping)
+    if verdict == "SAFE":
+        category = "safe"
+    elif verdict == "UNSAFE":
+        category = "unknown"  # Could be enhanced to detect specific unsafe category
+    else:
+        category = "unknown"
+
+    # Set confidence: high for clear verdicts, low for uncertain
+    confidence = 0.75 if verdict != "UNCERTAIN" else 0.0
+
+    return {
+        "verdict": verdict,
+        "category": category,
+        "confidence": confidence,
+        "reason": "guard verdict",
+        "frame_id": frame_id,
+        "timestamp_seconds": ts,
+        "raw": raw,  # Keep raw for debugging
+    }
+
+def extract_video_frames(video_url: str, num_frames: int = 5, frame_interval: Optional[float] = None) -> List[Dict[str, Any]]:
+    """
+    Extract frames from video using ffmpeg.
+    
+    Args:
+        video_url: URL or path to video file
+        num_frames: Number of frames to extract (default: 5)
+        frame_interval: Interval in seconds between frames (if None, evenly distributed)
+        
+    Returns:
+        List of frame dictionaries with 'frame_id', 'timestamp_seconds', and 'image_bytes'
+    """
+    import tempfile
+    
+    frames = []
+    
+    try:
+        # Get video duration first
+        probe_cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            video_url
+        ]
+        
+        p = subprocess.Popen(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = p.communicate(timeout=FFPROBE_TIMEOUT)
+        
+        if p.returncode != 0:
+            print(f"⚠️ Could not get video duration: {stderr.decode('utf-8', errors='ignore')}")
+            return frames
+        
+        duration = float(stdout.decode('utf-8').strip())
+        
+        # Calculate frame timestamps
+        if frame_interval:
+            timestamps = [i * frame_interval for i in range(num_frames) if i * frame_interval < duration]
+        else:
+            # Evenly distribute frames
+            if num_frames > 1:
+                timestamps = [duration * i / (num_frames - 1) for i in range(num_frames)]
+            else:
+                timestamps = [duration / 2]
+        
+        # Extract frames
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for idx, timestamp in enumerate(timestamps):
+                frame_id = f"frame_{idx+1}_{int(timestamp)}"
+                frame_path = os.path.join(tmpdir, f"{frame_id}.jpg")
+                
+                ffmpeg_cmd = [
+                    "ffmpeg",
+                    "-ss", str(timestamp),
+                    "-i", video_url,
+                    "-vframes", "1",
+                    "-q:v", "2",  # High quality
+                    "-y",
+                    frame_path
+                ]
+                
+                p = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                p.communicate(timeout=FFMPEG_TIMEOUT_PER_CLIP)
+                
+                if os.path.exists(frame_path):
+                    with open(frame_path, "rb") as f:
+                        image_bytes = f.read()
+                        frames.append({
+                            "frame_id": frame_id,
+                            "timestamp_seconds": timestamp,
+                            "image_bytes": image_bytes
+                        })
+    
+    except Exception as e:
+        print(f"⚠️ Error extracting frames: {e}")
+        traceback.print_exc()
+    
+    return frames
+
+
+async def classify_video_safety(video_url: str, use_batch: bool = True, num_frames: int = 5) -> Dict[str, Any]:
+    """
+    Classify video content for safety using frame extraction and Groq Llama Guard 4.
+    
+    Args:
+        video_url: URL or path to video file
+        use_batch: If True, classify all frames and determine overall verdict, else single frame only
+        num_frames: Number of frames to extract and classify
+        
+    Returns:
+        Dictionary with safety classification results
+        
+    Final video safety determination:
+        - If any frame verdict = UNSAFE with confidence >= 0.70 → VIDEO = UNSAFE
+        - Else if any frame = UNCERTAIN → VIDEO = UNCERTAIN
+        - Else VIDEO = SAFE
+    """
+    if not OPENAI_AVAILABLE:
+        print("⚠️ OpenAI SDK not available for content safety classification (required for Groq API)")
+        return {
+            "overall_video_verdict": "UNCERTAIN",
+            "overall_is_safe": None,
+            "overall_is_unsafe": None,
+            "overall_reason": "OpenAI SDK not installed",
+            "frames": []
+        }
+    
+    # ✅ Validate GROQ_API_KEY before proceeding
+    if not GROQ_API_KEY or not GROQ_API_KEY.strip():
+        error_msg = "GROQ_API_KEY is empty or not configured. Cannot perform content safety classification."
+        print(f"❌ {error_msg}")
+        print(f"   GROQ_API_KEY length: {len(GROQ_API_KEY) if GROQ_API_KEY else 0}")
+        return {
+            "overall_video_verdict": "UNCERTAIN",
+            "overall_is_safe": None,
+            "overall_is_unsafe": None,
+            "overall_reason": error_msg,
+            "frames": []
+        }
+    
+    try:
+        print(f"📹 Extracting {num_frames} frames from video: {video_url[:80]}...")
+        # Extract frames
+        frames_data = extract_video_frames(video_url, num_frames=num_frames)
+        print(f"📹 Extracted {len(frames_data)} frames")
+        
+        if not frames_data:
+            print("⚠️ No frames extracted from video")
+            return {
+                "overall_video_verdict": "UNCERTAIN",
+                "overall_is_safe": None,
+                "overall_is_unsafe": None,
+                "overall_reason": "Could not extract frames",
+                "frames": []
+            }
+        
+        # ✅ Use Groq instead of OpenAI - CRITICAL: Must use Groq base_url
+        # ✅ Validate API key before initializing client
+        api_key_clean = GROQ_API_KEY.strip()
+        if not api_key_clean:
+            raise ValueError("GROQ_API_KEY is empty after stripping whitespace")
+        
+        print(f"🔍 Initializing Groq client for frame safety (model: meta-llama/llama-guard-4-12b)...")
+        print(f"   🔑 API Key length: {len(api_key_clean)}, starts with: {api_key_clean[:5]}...")
+        
+        client = OpenAI(
+            base_url="https://api.groq.com/openai/v1",
+            api_key=api_key_clean,  # Use cleaned key
+        )
+        
+        # Verify client is using Groq endpoint
+        if hasattr(client, '_client') and hasattr(client._client, 'base_url'):
+            print(f"   ✅ Client base_url: {client._client.base_url}")
+        
+        print(f"   ✅ Using model: {GUARD_MODEL}")
+        
+        # Classify each frame individually using robust classification function
+        frame_results = []
+        
+        for frame_data in frames_data:
+            frame_id = frame_data["frame_id"]
+            timestamp = frame_data["timestamp_seconds"]
+            
+            # Build image URL for base64 encoded image
+            image_base64 = base64.b64encode(frame_data['image_bytes']).decode('utf-8')
+            image_url = f"data:image/jpeg;base64,{image_base64}"
+            
+            try:
+                print(f"   🔍 Classifying frame {frame_id} (timestamp: {timestamp:.1f}s) with Groq...")
+                
+                # ✅ Use robust classification function with JSON mode enforcement
+                result = classify_frame_safety_groq(client, image_url, timestamp, frame_id)
+                
+                verdict = result["verdict"]
+                confidence = result["confidence"]
+                category = result["category"]
+                reason = result["reason"]
+                
+                print(f"   ✅ Frame {frame_id} classified: {verdict} (confidence: {confidence:.2f})")
+                
+                frame_results.append({
+                    "frame_id": frame_id,
+                    "timestamp_seconds": timestamp,
+                    "verdict": verdict,
+                    "is_safe": (verdict == "SAFE"),
+                    "is_unsafe": (verdict == "UNSAFE"),
+                    "category": category,
+                    "confidence": confidence,
+                    "reason": reason
+                })
+                
+            except Exception as e:
+                error_msg = str(e)
+                print(f"⚠️ Error classifying frame {frame_id}: {error_msg}")
+                traceback.print_exc()
+                
+                # Mark frame as UNCERTAIN on error
+                frame_results.append({
+                    "frame_id": frame_id,
+                    "timestamp_seconds": timestamp,
+                    "verdict": "UNCERTAIN",
+                    "is_safe": None,
+                    "is_unsafe": None,
+                    "category": "unknown",
+                    "confidence": 0.0,
+                    "reason": f"Classification error: {error_msg[:50]}"
+                })
+        
+        # ✅ Determine overall video verdict using simple + safe rule
+        # Rule: If any frame verdict = UNSAFE with confidence >= 0.70 → VIDEO = UNSAFE
+        #       Else if any frame = UNCERTAIN → VIDEO = UNCERTAIN
+        #       Else VIDEO = SAFE
+        
+        overall_verdict = "SAFE"
+        overall_reason = "All frames classified as safe"
+        has_uncertain = False
+        
+        for frame_result in frame_results:
+            verdict = frame_result.get("verdict", "UNCERTAIN").upper()
+            confidence = frame_result.get("confidence", 0.0)
+            
+            if verdict == "UNSAFE" and confidence >= 0.70:
+                overall_verdict = "UNSAFE"
+                overall_reason = f"Unsafe content detected: {frame_result.get('reason', 'No reason')}"
+                break  # UNSAFE is definitive - stop checking
+            elif verdict == "UNCERTAIN":
+                has_uncertain = True
+        
+        if overall_verdict == "SAFE" and has_uncertain:
+            overall_verdict = "UNCERTAIN"
+            overall_reason = "Some frames could not be classified with certainty"
+        
+        return {
+            "overall_video_verdict": overall_verdict,
+            "overall_is_safe": (overall_verdict == "SAFE"),
+            "overall_is_unsafe": (overall_verdict == "UNSAFE"),
+            "overall_reason": overall_reason,
+            "frames": frame_results
+        }
+    
+    except Exception as e:
+        print(f"⚠️ Error classifying video safety: {e}")
+        traceback.print_exc()
+        return {
+            "overall_video_verdict": "UNCERTAIN",
+            "overall_is_safe": None,
+            "overall_is_unsafe": None,
+            "overall_reason": f"Classification error: {str(e)[:50]}",
+            "frames": []
+        }
+
+# ===============================
+# TRANSCRIPT SAFETY CLASSIFICATION (Groq)
+# ===============================
+"""
+Video Transcript Safety Check using Groq
+
+This module provides transcript-based content safety classification
+for educational videos using Groq API (Llama Guard or any classifier model).
+"""
+
+# PROMPT - Video Transcript Safety Check
+TRANSCRIPT_SAFETY_SYSTEM_PROMPT = """You are a content safety classifier.
+
+Your task is to analyze a VIDEO TRANSCRIPT and decide whether the video content is SAFE or UNSAFE for a general educational app.
+
+You must judge based on:
+- meaning
+- intent
+- instructional risk
+- persuasion risk
+
+NOT on keywords alone.
+
+Political education and neutral historical discussion are SAFE.
+Political persuasion, propaganda, or targeted influence are UNSAFE.
+
+Medical and educational discussion of sensitive topics is SAFE.
+Explicit sexual content, self-harm instructions, violence instructions are UNSAFE.
+
+Return ONLY valid JSON.
+Do not explain your reasoning."""
+
+def get_transcript_safety_user_prompt(transcript: str) -> str:
+    """
+    Generate the user prompt for transcript safety classification.
+    
+    Args:
+        transcript: Full video transcript text
+        
+    Returns:
+        User prompt string
+    """
+    return f"""Analyze the following video transcript and classify its safety.
+
+Transcript:
+\"\"\"
+{transcript}
+\"\"\"
+
+Return JSON in the following exact format:
+
+{{
+  "verdict": "SAFE" | "UNSAFE",
+  "category": "education | medical | sexual | political_persuasion | violence | self_harm | hate | illegal | mixed | unknown",
+  "confidence": 0.0,
+  "reason": "short human-readable reason"
+}}"""
+
+def extract_first_json_object(text: str) -> dict:
+    """
+    Extract the first JSON object from text (robust extractor for safety classification).
+    """
+    text = text.strip()
+    
+    # Remove markdown code blocks
+    text = re.sub(r"```json\s*", "", text)
+    text = re.sub(r"```\s*", "", text)
+    text = text.strip()
+    
+    # Try to find JSON object first
+    object_match = re.search(r"\{\s*[^}]*\"verdict\".*?\}", text, re.DOTALL)
+    if object_match:
+        js = object_match.group(0)
+        js = re.sub(r"[\x00-\x1F\x7F]", "", js)  # Remove control characters
+        js = re.sub(r",\s*}", "}", js)  # Fix trailing commas
+        try:
+            parsed = json.loads(js)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    
+    # Fallback: try to find any JSON object
+    object_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if object_match:
+        js = object_match.group(0)
+        js = re.sub(r"[\x00-\x1F\x7F]", "", js)
+        js = re.sub(r",\s*}", "}", js)
+        try:
+            parsed = json.loads(js)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    
+    raise ValueError("No valid JSON object found in response")
+
+def classify_transcript_safety(transcript: str) -> Dict[str, Any]:
+    """
+    Classify video transcript for safety using Groq API.
+    
+    Args:
+        transcript: Full video transcript text
+        
+    Returns:
+        Dictionary with safety classification results:
+        {
+            "verdict": "SAFE" | "UNSAFE",
+            "category": str,
+            "confidence": float,
+            "reason": str,
+            "needs_manual_review": bool
+        }
+    """
+    if not GROQ_API_KEY:
+        print("⚠️ GROQ_API_KEY not configured for transcript safety classification")
+        return {
+            "verdict": "UNCERTAIN",
+            "category": "unknown",
+            "confidence": 0.0,
+            "reason": "Groq API not configured",
+            "needs_manual_review": True
+        }
+    
+    if not transcript or len(transcript.strip()) < 50:
+        print("⚠️ Transcript too short for safety classification")
+        return {
+            "verdict": "UNCERTAIN",
+            "category": "unknown",
+            "confidence": 0.0,
+            "reason": "Transcript too short",
+            "needs_manual_review": True
+        }
+    
+    try:
+        import requests
+        
+        # Truncate transcript if too long (Groq has token limits)
+        max_transcript_length = 8000  # Conservative limit
+        transcript_text = transcript[:max_transcript_length]
+        if len(transcript) > max_transcript_length:
+            print(f"   ⚠️ Transcript truncated from {len(transcript)} to {max_transcript_length} chars for safety check")
+        
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        user_prompt = get_transcript_safety_user_prompt(transcript_text)
+        
+        body = {
+            "model": GROQ_MODEL,
+            "messages": [
+                {"role": "system", "content": TRANSCRIPT_SAFETY_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt}
+            ],
+            "temperature": 0.1,  # Low temperature for consistent classification
+            "max_tokens": 200
+        }
+        
+        print(f"🔍 Classifying transcript safety (length: {len(transcript_text)} chars)...")
+        
+        # Use retry wrapper with exponential backoff
+        response = groq_post_with_retry(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            payload=body,
+            timeout=30
+        )
+        
+        result = response.json()
+        content = result["choices"][0]["message"]["content"].strip()
+        
+        # Extract JSON object
+        try:
+            safety_result = extract_first_json_object(content)
+        except ValueError:
+            # Fallback: try direct JSON parse
+            try:
+                safety_result = json.loads(content)
+            except json.JSONDecodeError:
+                print(f"⚠️ Could not parse safety classification JSON: {content[:200]}")
+                return {
+                    "verdict": "UNCERTAIN",
+                    "category": "unknown",
+                    "confidence": 0.0,
+                    "reason": "Failed to parse classification response",
+                    "needs_manual_review": True
+                }
+        
+        # Validate and normalize result
+        verdict = safety_result.get("verdict", "UNCERTAIN").upper()
+        if verdict not in ["SAFE", "UNSAFE"]:
+            verdict = "UNCERTAIN"
+        
+        category = safety_result.get("category", "unknown")
+        confidence = float(safety_result.get("confidence", 0.0))
+        reason = safety_result.get("reason", "No reason provided")
+        
+        # Determine if manual review is needed
+        needs_manual_review = confidence < 0.6
+        
+        result_dict = {
+            "verdict": verdict,
+            "category": category,
+            "confidence": confidence,
+            "reason": reason,
+            "needs_manual_review": needs_manual_review
+        }
+        
+        print(f"✅ Transcript safety classification: {verdict} (confidence: {confidence:.2f}, category: {category})")
+        if needs_manual_review:
+            print(f"   ⚠️ Low confidence ({confidence:.2f} < 0.6) - marked for manual review")
+        
+        return result_dict
+        
+    except Exception as e:
+        print(f"⚠️ Error classifying transcript safety: {e}")
+        traceback.print_exc()
+        return {
+            "verdict": "UNCERTAIN",
+            "category": "unknown",
+            "confidence": 0.0,
+            "reason": f"Classification error: {str(e)[:100]}",
+            "needs_manual_review": True
+        }
+
+# ===============================
+# GROQ MODEL VALIDATION
+# ===============================
+# ✅ Supported Groq models (updated to prevent deprecated model errors)
+SUPPORTED_GROQ_MODELS = [
+    "groq/compound-mini",   # Default model (widely available)
+    "llama3-7b-8192",       # Smaller model (if available)
+    "llama3-14b-8192",      # Recommended for web search questions (if available)
+    "llama3-70b-8192",      # Larger model for complex tasks (if available)
+    "llama-3.1-8b-instant", # Fast model for general question generation (if available)
+    "llama-3.1-70b-versatile" # Versatile model for complex tasks (if available)
+]
+
+# ✅ Explicitly deprecated models (for additional safety check)
+DEPRECATED_GROQ_MODELS = [
+    "llama3-8b-8192"  # Decommissioned - use llama3-14b-8192 instead
+]
+
+def get_available_groq_models() -> List[str]:
+    """
+    ✅ Auto-detect available Groq models from the API.
+    
+    Returns:
+        List of available model IDs that are active
+    """
+    if not GROQ_API_KEY:
+        return []
+    
+    try:
+        import requests
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+        response = requests.get(
+            "https://api.groq.com/openai/v1/models",
+            headers=headers,
+            timeout=10
+        )
+        response.raise_for_status()
+        data = response.json()
+        available_models = [m["id"] for m in data.get("data", []) if m.get("active", False)]
+        return available_models
+    except Exception as e:
+        print(f"⚠️ Could not fetch available models: {e}")
+        return []
+
+def validate_groq_model(model_name: str) -> None:
+    """
+    ✅ Validate that the Groq model is supported (not decommissioned).
+    
+    Args:
+        model_name: The model name to validate
+        
+    Raises:
+        RuntimeError: If model is deprecated or not in the supported list
+    """
+    # ✅ First check if explicitly deprecated
+    if model_name in DEPRECATED_GROQ_MODELS:
+        raise RuntimeError(
+            f"Model '{model_name}' has been decommissioned and is no longer supported. "
+            f"Use 'groq/compound-mini' or check available models. "
+            f"See https://console.groq.com/docs/deprecations for details."
+        )
+    
+    # ✅ Then check if in supported list (or allow if it's a valid Groq model format)
+    if model_name not in SUPPORTED_GROQ_MODELS:
+        # Allow groq/* models even if not explicitly listed
+        if not model_name.startswith("groq/") and not model_name.startswith("llama"):
+            raise RuntimeError(
+                f"Model '{model_name}' is not in the supported list. "
+                f"Use one of: {', '.join(SUPPORTED_GROQ_MODELS)}. "
+                f"See https://console.groq.com/docs/deprecations for details."
+            )
+
+# ===============================
+# GROQ API RETRY WRAPPER (Exponential Backoff for 429)
+# ===============================
+def groq_post_with_retry(url: str, headers: dict, payload: dict, timeout: int = 60, max_retries: int = 5) -> Any:
+    """
+    ✅ FIX: Groq API wrapper with exponential backoff for retryable errors only.
+    
+    Retry logic:
+    - ✅ Retry on: 429 (rate limit), 500, 502, 503 (server errors)
+    - ❌ DO NOT retry on: 400 (bad request - client error, will never succeed)
+    
+    Args:
+        url: Groq API endpoint URL
+        headers: Request headers (must include Authorization)
+        payload: Request payload (JSON)
+        timeout: Request timeout in seconds
+        max_retries: Maximum number of retry attempts
+        
+    Returns:
+        Response object from requests.post
+        
+    Raises:
+        RuntimeError: If request failed after all retries
+        requests.HTTPError: For non-retryable errors (400, etc.)
+    """
+    import requests
+    
+    # ✅ Validate URL (catch typos like httpss://)
+    if not url.startswith("https://"):
+        raise ValueError(f"Invalid URL format: {url} (must start with https://)")
+    
+    # ✅ Validate model is supported (prevent deprecated model errors)
+    model_name = payload.get("model", "")
+    if model_name:
+        validate_groq_model(model_name)
+    
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            
+            if response.status_code == 200:
+                return response
+            
+            # ✅ Retry only on rate limit or server errors (429, 500, 502, 503)
+            if response.status_code in (429, 500, 502, 503):
+                wait = 2 ** attempt
+                status_name = {429: "Rate limited", 500: "Server error", 502: "Bad gateway", 503: "Service unavailable"}.get(response.status_code, f"Error {response.status_code}")
+                print(f"⚠️ {status_name} ({response.status_code}). Sleeping {wait}s before retry {attempt + 1}/{max_retries}...")
+                time.sleep(wait)
+                continue
+            
+            # ❌ 400-level errors → DO NOT RETRY (client error, will never succeed)
+            if 400 <= response.status_code < 500:
+                print(f"❌ Client error ({response.status_code}): {response.text[:200]}")
+                response.raise_for_status()
+            
+            # For other errors, raise immediately
+            response.raise_for_status()
+            
+        except requests.exceptions.Timeout:
+            if attempt == max_retries - 1:
+                raise RuntimeError(f"Groq API timeout after {max_retries} attempts")
+            wait = 2 ** attempt
+            print(f"⚠️ Request timeout. Sleeping {wait}s before retry {attempt + 1}/{max_retries}...")
+            time.sleep(wait)
+        except requests.exceptions.RequestException as e:
+            if attempt == max_retries - 1:
+                raise RuntimeError(f"Groq API request failed after {max_retries} attempts: {e}")
+            wait = 2 ** attempt
+            print(f"⚠️ Request error: {e}. Sleeping {wait}s before retry {attempt + 1}/{max_retries}...")
+            time.sleep(wait)
+    
+    raise RuntimeError(f"Groq request failed after {max_retries} retries")
 
 # ===============================
 # SQLAlchemy setup (async)
@@ -138,6 +1212,7 @@ class VideoMCQ(Base):
     schema_version: Mapped[str] = mapped_column(String(10), default="1.0", nullable=False)  # For future migrations
     generation_mode: Mapped[str] = mapped_column(String(20), default="legacy", nullable=False)  # exam-grade or legacy
     quality_metrics: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)  # Quality stats: rejection_rate, avg_quality_score
+    content_safety: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)  # Content safety classification result (SAFE/UNSAFE/UNCERTAIN)
     
     # Audit Trail
     created_by: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # API key, user ID, or system
@@ -203,6 +1278,9 @@ async def lifespan(app: FastAPI):
     if engine:
         await engine.dispose()
         print("✅ Database connection closed")
+    if mongo_client is not None:
+        mongo_client.close()
+        print("✅ MongoDB connection closed")
 
 # ===============================
 # FASTAPI
@@ -329,6 +1407,129 @@ def build_topic_chunks(transcript_segments: List[Dict[str, Any]], video_duration
     
     return chunks
 
+def extract_first_json_array(text: str) -> list:
+    """
+    Extract the first JSON array from text (robust extractor for chunk questions).
+    Uses the same logic as safe_json_extract but specifically for arrays.
+    """
+    text = text.strip()
+    
+    # Remove markdown code blocks
+    text = re.sub(r"```json\s*", "", text)
+    text = re.sub(r"```\s*", "", text)
+    text = text.strip()
+    
+    # Try to find JSON array first
+    array_match = re.search(r"\[\s*{.*}\s*\]", text, re.DOTALL)
+    if array_match:
+        js = array_match.group(0)
+        js = re.sub(r"[\x00-\x1F\x7F]", "", js)  # Remove control characters
+        js = re.sub(r",\s*}", "}", js)  # Fix trailing commas
+        js = re.sub(r",\s*]", "]", js)
+        try:
+            parsed = json.loads(js)
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    
+    raise ValueError("No valid JSON array found in response")
+
+
+def groq_generate_one_chunk_mcq(chunk_text: str) -> dict:
+    """
+    ✅ FALLBACK: Generate exactly 1 MCQ from chunk text (super stable).
+    Used when chunk generation fails to guarantee we always get questions.
+    """
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY not configured")
+    
+    if not chunk_text or len(chunk_text.strip()) < 20:
+        raise ValueError("Chunk text too short for fallback generation")
+    
+    prompt = f"""Generate EXACTLY ONE MCQ from the text below.
+
+Rules:
+- Return ONLY a JSON array with exactly 1 object.
+- No extra text.
+
+Schema:
+[
+  {{
+    "question":"...",
+    "options":{{"A":"...","B":"...","C":"...","D":"..."}},
+    "correct_answer":"A",
+    "anchor_type":"TOPIC_CHUNK"
+  }}
+]
+
+TEXT:
+{chunk_text[:2000]}""".strip()  # Limit chunk text to avoid token limits
+
+    try:
+        import requests
+        
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        body = {
+            "model": GROQ_MODEL,
+            "messages": [
+                {"role": "system", "content": "Return only valid JSON array. No extra text."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.3,
+            "max_tokens": 500
+        }
+        
+        # ✅ Use retry wrapper with exponential backoff
+        response = groq_post_with_retry(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            payload=body,
+            timeout=30
+        )
+        
+        result = response.json()
+        content = result["choices"][0]["message"]["content"].strip()
+        
+        # Extract JSON array using robust extractor
+        arr = extract_first_json_array(content)
+        
+        if not arr or len(arr) == 0:
+            raise ValueError("Empty array returned from Groq")
+        
+        q = arr[0]
+        
+        # Validate and normalize question
+        question_text = (q.get("question") or "").strip()
+        options = q.get("options") or {}
+        correct_answer = (q.get("correct_answer") or "").strip().upper()
+        
+        if not question_text or not options or correct_answer not in ["A", "B", "C", "D"]:
+            raise ValueError("Invalid question structure from fallback")
+        
+        # Normalize options
+        normalized_options = {}
+        for key in ["A", "B", "C", "D"]:
+            opt_text = str(options.get(key, "")).strip()
+            if not opt_text:
+                raise ValueError(f"Missing option {key}")
+            normalized_options[key] = opt_text
+        
+        return {
+            "question": question_text,
+            "options": normalized_options,
+            "correct_answer": correct_answer,
+            "anchor_type": "TOPIC_CHUNK"
+        }
+        
+    except Exception as e:
+        print(f"⚠️ Fallback MCQ generation failed: {e}")
+        raise
+
 def generate_mcqs_from_chunk_groq(chunk_text: str, chunk_num: int, question_count: int) -> List[Dict[str, Any]]:
     """
     Generate MCQs from a topic chunk using Groq API (fast).
@@ -402,19 +1603,27 @@ Generate {question_count} question(s) now:"""
     }
     
     try:
-        response = requests.post(
+        # ✅ Use retry wrapper with exponential backoff
+        response = groq_post_with_retry(
             "https://api.groq.com/openai/v1/chat/completions",
             headers=headers,
-            json=payload,
+            payload=payload,
             timeout=30
         )
-        response.raise_for_status()
         
         result = response.json()
         content = result["choices"][0]["message"]["content"].strip()
         
-        # Extract JSON from response
-        data = safe_json_extract(content)
+        # Extract JSON from response (use robust extractor that handles arrays)
+        # Try to extract as array first, then fallback to object
+        try:
+            data = extract_first_json_array(content)
+            # If we got an array directly, wrap it in a dict with "questions" key
+            if isinstance(data, list):
+                data = {"questions": data}
+        except ValueError:
+            # Fallback to object extraction
+            data = safe_json_extract(content)
         
         questions = []
         if "questions" in data and isinstance(data["questions"], list):
@@ -488,8 +1697,15 @@ def generate_mcqs_from_topic_chunks(transcript_segments: List[Dict[str, Any]], v
         chunk_questions = generate_mcqs_from_chunk_groq(chunk_text, chunk_num, question_count)
         
         if not chunk_questions:
-            print(f"   ⚠️ Chunk {chunk_num}: Failed to generate questions, skipping...")
-            continue
+            print(f"   ⚠️ Chunk {chunk_num}: Failed to generate questions, using fallback...")
+            try:
+                # ✅ FALLBACK: Generate 1 question instead of skipping
+                fallback_q = groq_generate_one_chunk_mcq(chunk_text)
+                chunk_questions = [fallback_q]
+                print(f"   ✅ Chunk {chunk_num}: Fallback generated 1 question")
+            except Exception as e:
+                print(f"   ⚠️ Chunk {chunk_num}: Fallback also failed: {e}")
+                continue  # Skip this chunk if even fallback fails
         
         # Set timestamps: questions appear at chunk end (topic boundary)
         # For last chunk (chunk 3), ensure it's at least (video_duration - 2)
@@ -521,14 +1737,1010 @@ def generate_mcqs_from_topic_chunks(transcript_segments: List[Dict[str, Any]], v
         
         print(f"   ✅ Chunk {chunk_num}: Generated {len(chunk_questions)} question(s) at {chunk_end:.1f}s")
     
+    # ✅ FINAL GUARANTEE: If still < 5 questions, generate from last chunk until we have 5
+    while len(all_questions) < 5 and len(chunks) > 0:
+        last_chunk = chunks[-1]
+        last_chunk_text = last_chunk["text"]
+        last_chunk_end = last_chunk["end"]
+        
+        try:
+            print(f"   🔄 Generating fallback question {len(all_questions) + 1}/5 from last chunk...")
+            fallback_q = groq_generate_one_chunk_mcq(last_chunk_text)
+            
+            # Set timestamp and metadata
+            fallback_q["timestamp_seconds"] = round(last_chunk_end, 2)
+            fallback_q["timestamp"] = seconds_to_mmss(last_chunk_end)
+            fallback_q["batch_number"] = last_chunk["chunk_num"]
+            fallback_q["anchor_type"] = "TOPIC_CHUNK"
+            fallback_q["question_index"] = len(all_questions) + 1
+            fallback_q["chunk_num"] = last_chunk["chunk_num"]
+            
+            all_questions.append(fallback_q)
+            print(f"   ✅ Fallback question {len(all_questions)}/5 generated")
+        except Exception as e:
+            print(f"   ⚠️ Final fallback generation failed: {e}")
+            break  # Stop trying if fallback keeps failing
+    
     # Ensure we have exactly 5 questions
-    if len(all_questions) < 5:
-        print(f"   ⚠️ Warning: Only generated {len(all_questions)} questions (target: 5)")
+    all_questions = all_questions[:5]
     
     # Sort by question index to ensure order
     all_questions.sort(key=lambda q: q.get("question_index", 0))
     
-    return all_questions[:5], chunk_metadata
+    print(f"   ✅ Generated {len(all_questions)} questions from chunks (target: 5)")
+    
+    return all_questions, chunk_metadata
+
+# ===============================
+# WEB SEARCH QUESTION GENERATION
+# ===============================
+def extract_keywords_from_transcript(transcript: str, max_keywords: int = 10) -> List[str]:
+    """
+    Extract top keywords from transcript (fallback method).
+    
+    Note: Primary method uses Groq to generate Wikipedia-friendly queries.
+    This is used as fallback if Groq query generation fails.
+    
+    Args:
+        transcript: Full video transcript text
+        max_keywords: Maximum number of keywords to extract
+        
+    Returns:
+        List of keyword strings
+    """
+    # Simple keyword extraction: pick top "topic-ish" words
+    # Remove common stop words and extract meaningful terms
+    words = re.findall(r'\b[a-zA-Z]{3,}\b', transcript.lower())
+    
+    # Common stop words to filter out
+    stop_words = {
+        'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'her', 'was', 'one', 'our', 'out', 'day', 'get', 'has', 'him', 'his', 'how', 'its', 'may', 'new', 'now', 'old', 'see', 'two', 'way', 'who', 'boy', 'did', 'its', 'let', 'put', 'say', 'she', 'too', 'use'
+    }
+    
+    # Count word frequencies
+    word_freq = defaultdict(int)
+    for word in words:
+        if word not in stop_words and len(word) > 3:
+            word_freq[word] += 1
+    
+    # Get top keywords
+    sorted_words = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)
+    keywords = [word for word, freq in sorted_words[:max_keywords]]
+    
+    return keywords if keywords else ["video", "tutorial", "lesson"]
+
+def extract_topic_terms(transcript: str) -> List[str]:
+    """
+    Auto-extract TOPIC_TERMS from transcript using Groq (universal for all videos).
+    
+    Extracts 12 topic terms that represent the core topic of the video.
+    
+    Args:
+        transcript: Full video transcript text
+        
+    Returns:
+        List of 12 topic term strings (noun phrases, 1-4 words)
+    """
+    if not GROQ_API_KEY:
+        print("⚠️ GROQ_API_KEY not configured. Using fallback keywords.")
+        return []
+    
+    try:
+        import requests
+    except ImportError:
+        return []
+    
+    prompt = f"""Extract 10-15 specific topic_terms from the transcript.
+
+Rules:
+- noun phrases only (1–4 words)
+- must be specific to the video topic
+- DO NOT include generic terms: data, database, system, technology, process, information, basics, introduction, overview, concept, real-time, processing
+- These terms will be used to search Wikipedia, so prefer entity names (products, technologies, concepts)
+
+Return JSON only:
+{{"topic_terms":[...]}}
+
+Transcript:
+<<<
+{transcript[:3000]}
+>>>
+
+Return format:
+{{"topic_terms": ["term1", "term2", "term3", ...]}}
+"""
+    
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "model": "llama-3.1-8b-instant",  # Fast model for topic extraction
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.3
+    }
+    
+    try:
+        # ✅ Use retry wrapper with exponential backoff
+        response = groq_post_with_retry(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            payload=payload,
+            timeout=15
+        )
+        
+        result = response.json()
+        content = result["choices"][0]["message"]["content"].strip()
+        
+        # Extract JSON object with topic_terms
+        data = safe_json_extract(content)
+        
+        if isinstance(data, dict) and "topic_terms" in data:
+            raw_terms = [str(term).strip() for term in data["topic_terms"][:12] if term]
+        elif isinstance(data, list) and len(data) > 0:
+            # Fallback: if it returns an array directly
+            raw_terms = [str(term).strip() for term in data[:12] if term]
+        else:
+            print("⚠️ Could not parse topic_terms from Groq response")
+            return []
+        
+        # ✅ Rule A: Hard clean filter - Remove generic terms and short terms
+        generic_stoplist = {
+            'data', 'database', 'system', 'technology', 'process', 'information', 
+            'basics', 'introduction', 'overview', 'concept', 'real-time', 'processing'
+        }
+        
+        # Filter out generic terms and short terms (< 4 characters)
+        topic_terms = []
+        for term in raw_terms:
+            term_lower = term.lower().strip()
+            # Skip if too short
+            if len(term_lower) < 4:
+                continue
+            # Skip if in generic stoplist
+            if term_lower in generic_stoplist:
+                continue
+            # Skip if starts with generic word
+            if any(term_lower.startswith(stop) for stop in generic_stoplist):
+                continue
+            topic_terms.append(term)
+        
+        print(f"   ✅ Extracted {len(topic_terms)} clean topic terms: {', '.join(topic_terms[:5])}...")
+        return topic_terms[:15]  # Return up to 15 topic terms
+            
+    except Exception as e:
+        print(f"⚠️ Error extracting topic terms: {e}")
+        return []
+
+def is_entity_like_title(title: str, topic_terms_lower: List[str]) -> bool:
+    """
+    Determine if a Wikipedia title is "entity-like" (main topic page).
+    
+    Entity-like heuristic (Rule B):
+    - Title exactly matches a topic term (or close fuzzy match ≥0.88)
+    - OR title has no spaces (common for main topics like "MongoDB")
+    - OR title is short TitleCase (1-3 words)
+    
+    Args:
+        title: Wikipedia page title
+        topic_terms_lower: List of topic terms (lowercased) for matching
+        
+    Returns:
+        True if title is entity-like (main topic page), False otherwise
+    """
+    title_lower = title.lower().strip()
+    
+    # Check 1: Exact match or close fuzzy match with any topic term
+    for term_lower in topic_terms_lower:
+        if title_lower == term_lower:
+            return True
+        # Simple fuzzy match: if title contains term or term contains title (for variations)
+        if len(term_lower) > 3 and len(title_lower) > 3:
+            if term_lower in title_lower or title_lower in term_lower:
+                # Calculate simple similarity (character overlap)
+                min_len = min(len(term_lower), len(title_lower))
+                max_len = max(len(term_lower), len(title_lower))
+                if min_len / max_len >= 0.88:  # ≥88% similarity
+                    return True
+    
+    # Check 2: No spaces (common for main topics like "MongoDB", "Redis", "Python")
+    if ' ' not in title:
+        return True
+    
+    # Check 3: Short TitleCase (1-3 words)
+    words = title.split()
+    if len(words) <= 3:
+        # Check if it's TitleCase (first letter of each word is uppercase)
+        if all(word and word[0].isupper() for word in words):
+            return True
+    
+    return False
+
+def get_web_evidence_from_wikipedia(transcript: str, topic_terms: List[str] = None) -> Tuple[str, List[str], List[Dict[str, str]]]:
+    """
+    Get ~1000 words of article text from Wikipedia API for question generation.
+    
+    Process:
+    1. Extract TOPIC_TERMS from transcript (if not provided)
+    2. Use TOPIC_TERMS to search Wikipedia
+    3. Fetch summaries and filter by topic (keep only if ≥2 topic_terms appear)
+    4. Accumulate ~1000 words of article text
+    
+    Args:
+        transcript: Full video transcript text
+        topic_terms: Optional list of topic terms (if not provided, will be extracted)
+        
+    Returns:
+        Tuple of (article_text_string, topic_terms_list, wiki_blocks_list)
+        wiki_blocks_list: List of dicts with 'title' and 'text' keys for OpenAI synthesis
+    """
+    try:
+        import requests
+        from urllib.parse import quote_plus
+        import re
+    except ImportError:
+        raise RuntimeError("requests library not installed. Install with: pip install requests")
+    
+    # Step 1: Extract TOPIC_TERMS from transcript (if not provided)
+    if topic_terms is None or len(topic_terms) == 0:
+        print("   🤖 Extracting topic terms from transcript...")
+        topic_terms = extract_topic_terms(transcript)
+        
+        # Fallback to keyword extraction if Groq fails
+        if not topic_terms:
+            print("   ⚠️ Using fallback keyword extraction...")
+            keywords = extract_keywords_from_transcript(transcript)
+            topic_terms = keywords[:15]  # Extract up to 15 terms
+    
+    if not topic_terms:
+        print("⚠️ No topic terms available for Wikipedia search")
+        return "NO_EVIDENCE_RETURNED_FROM_WIKIPEDIA", [], []
+    
+    print(f"   📌 Using {len(topic_terms)} topic terms for Wikipedia search")
+    
+    article_text_parts = []
+    wiki_blocks = []  # Structured blocks for OpenAI synthesis
+    total_words = 0
+    target_words_min = 1000  # Target ~1000-1200 words
+    target_words_max = 1200
+    target_words = target_words_max  # Stop at 1200
+    
+    # Track pages we've already fetched to avoid duplicates
+    fetched_titles = set()
+    
+    # Normalize topic_terms for matching (lowercase)
+    topic_terms_lower = [term.lower() for term in topic_terms]
+    
+    # Step 2: For each topic term, search Wikipedia and get page titles
+    for term in topic_terms[:10]:  # Use top 10 topic terms
+        if total_words >= target_words:
+            break
+        
+        try:
+            # Use Wikipedia Search API (search/title) to find page titles
+            search_url = f"https://en.wikipedia.org/w/rest.php/v1/search/title?q={quote_plus(term)}&limit=5"
+            search_response = requests.get(
+                search_url,
+                timeout=10,
+                headers={"User-Agent": "VideoMCQGenerator/1.0 (https://example.com/contact)"}
+            )
+            
+            if search_response.status_code == 200:
+                search_results = search_response.json()
+                pages = search_results.get("pages", [])
+                
+                # Step 3: For each page title, fetch summary and filter by topic
+                for page in pages[:3]:  # Get top 3 results per term
+                    if total_words >= target_words:
+                        break
+                    
+                    page_title = page.get("title", "")
+                    page_key = page.get("key", "")
+                    
+                    # ✅ Banlist: Reject titles containing drift magnets
+                    title_banlist = {'data', 'database', 'sequel', 'normalization', 'data center', 'datacenter'}
+                    title_lower = page_title.lower()
+                    if any(banned in title_lower for banned in title_banlist):
+                        print(f"   ⏭️ Skipping '{page_title}': contains banned term (drift magnet)")
+                        continue
+                    
+                    # Use page_key (normalized title) or title
+                    title_to_use = page_key if page_key else page_title
+                    
+                    # Skip if we've already fetched this page
+                    if title_to_use in fetched_titles:
+                        continue
+                    
+                    if title_to_use:
+                        fetched_titles.add(title_to_use)
+                        
+                        try:
+                            # Fetch page summary using exact title/key
+                            summary_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote_plus(title_to_use)}"
+                            summary_response = requests.get(
+                                summary_url,
+                                timeout=10,
+                                headers={"User-Agent": "VideoMCQGenerator/1.0 (https://example.com/contact)"}
+                            )
+                            
+                            if summary_response.status_code == 200:
+                                summary_data = summary_response.json()
+                                
+                                # Get the extract (main article text)
+                                if summary_data.get("extract"):
+                                    extract = summary_data["extract"]
+                                    # Clean HTML tags if any
+                                    extract = re.sub(r'<[^>]+>', '', extract)
+                                    
+                                    # ✅ Rule B: Wikipedia page acceptance (with entity-like exception)
+                                    extract_lower = extract.lower()
+                                    # Count distinct topic_terms that appear in extract
+                                    matched_terms = [term_lower for term_lower in topic_terms_lower if term_lower in extract_lower]
+                                    topic_matches = len(set(matched_terms))  # Use set to count distinct terms
+                                    
+                                    # Determine threshold: ≥2 normally, ≥1 if entity-like title
+                                    is_entity = is_entity_like_title(page_title, topic_terms_lower)
+                                    required_matches = 1 if is_entity else 2
+                                    
+                                    if topic_matches < required_matches:
+                                        entity_note = " (entity-like, need ≥1)" if is_entity else " (need ≥2)"
+                                        print(f"   ⏭️ Skipping '{page_title}': only {topic_matches} distinct topic term(s) matched{entity_note}")
+                                        continue
+                                    
+                                    # Log entity-like pages with lower threshold
+                                    if is_entity:
+                                        print(f"   ✅ Entity-like title '{page_title}' accepted with {topic_matches} topic match(es)")
+                                    
+                                    # Count words in this extract
+                                    word_count = len(extract.split())
+                                    
+                                    # Add title and extract
+                                    title = summary_data.get("title", page_title)
+                                    article_text_parts.append(f"[{title}]\n{extract}\n")
+                                    # Also store as structured block for OpenAI synthesis
+                                    wiki_blocks.append({"title": title, "text": extract})
+                                    total_words += word_count
+                                    
+                                    print(f"   📄 Fetched '{title}': {word_count} words, {topic_matches} distinct topic matches (total: {total_words}/{target_words})")
+                                    
+                                    # Stop when reaching target (800-1000 words)
+                                    if total_words >= target_words_min:
+                                        if total_words >= target_words_max:
+                                            break
+                        except Exception as e:
+                            print(f"⚠️ Error fetching page '{title_to_use}': {e}")
+                            continue
+            
+        except Exception as e:
+            print(f"⚠️ Wikipedia search error for term '{term}': {e}")
+            continue
+    
+    # Combine all article text parts
+    article_text = "\n".join(article_text_parts)
+    
+    if article_text:
+        final_word_count = len(article_text.split())
+        print(f"✅ Wikipedia article text: {final_word_count} words (filtered by {len(topic_terms)} topic terms)")
+        return article_text, topic_terms, wiki_blocks
+    else:
+        print("⚠️ No Wikipedia content found (all articles filtered out by topic terms)")
+        return "NO_EVIDENCE_RETURNED_FROM_WIKIPEDIA", topic_terms, []
+
+TARGET_ARTICLE_WORDS = 1200  # Target word count for final article (max 1200)
+
+def _sentences_for_pad(text: str):
+    """Extract sentences from text for padding (removes timestamps)."""
+    # remove timestamps like [00:12]
+    text = re.sub(r"\[[0-9:\s]+\]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    parts = re.split(r'(?<=[.!?])\s+', text)
+    return [p.strip() for p in parts if p.strip()]
+
+def trim_to_words(text: str, target: int = 1200, pad_source: str = "") -> str:
+    """
+    ✅ FIXED: Guaranteed to return EXACTLY `target` words (not more than target).
+    If `text` is short, pads using pad_source (transcript) sentences.
+    If no pad_source, repeats existing words as last resort.
+    
+    Args:
+        text: Article text to trim
+        target: Target word count (default: 1200, max: 1200)
+        pad_source: Source text (transcript) to use for padding if article is too short
+        
+    Returns:
+        Text with exactly target words (padded if needed, trimmed if too long, never exceeds target)
+    """
+    words = text.split()
+
+    if len(words) < target:
+        sents = _sentences_for_pad(pad_source) if pad_source else []
+        if not sents:
+            # last resort: repeat existing words (still deterministic)
+            if not words:
+                return ""
+            while len(words) < target:
+                words += words[: min(len(words), target - len(words))]
+            return " ".join(words[:target]).strip()
+
+        i = 0
+        # append transcript sentences cyclically until enough words
+        while len(words) < target and i < 20000:
+            words += sents[i % len(sents)].split()
+            i += 1
+
+    return " ".join(words[:target]).strip()
+
+def is_valid_article(text: str) -> bool:
+    """
+    ✅ VALIDATE: Check if article is clean and professional (no spoken phrases/fillers).
+    
+    Args:
+        text: Article text to validate
+        
+    Returns:
+        True if article is valid (no banned phrases), False otherwise
+    """
+    if not text or len(text.strip()) < 100:
+        return False
+    
+    banned_phrases = [
+        "namaste",
+        "so let's see",
+        "what do you think",
+        "today we will",
+        "you are watching",
+        "let's get started",
+        "welcome to",
+        "hey guys",
+        "hello everyone",
+        "thanks for watching",
+        "don't forget to",
+        "if you like this video",
+        "subscribe to",
+        "hit the like button"
+    ]
+    
+    text_lower = text.lower()
+    for phrase in banned_phrases:
+        if phrase in text_lower:
+            print(f"   ❌ Article validation failed: found banned phrase '{phrase}'")
+            return False
+    
+    return True
+
+def generate_article_from_transcript(transcript: str) -> str:
+    """
+    ✅ FIXED: Rewrite transcript into professional web-ready article, over-generate then trim to exactly 1200 words.
+    
+    Rule: Use strict rewrite prompt, validate quality, regenerate if needed. Never exceed 1200 words.
+    
+    Args:
+        transcript: Full video transcript text
+        
+    Returns:
+        Article text with exactly 1200 words (never more than 1200, clean and professional)
+    """
+    max_regeneration_attempts = 3
+    
+    for attempt in range(max_regeneration_attempts):
+        if not GROQ_API_KEY:
+            # Fallback to OpenAI if Groq not available
+            if not OPENAI_API_KEY or not OPENAI_AVAILABLE:
+                raise RuntimeError("GROQ_API_KEY or OPENAI_API_KEY required for article generation")
+            
+            # Use OpenAI
+            client = OpenAI(api_key=OPENAI_API_KEY)
+            prompt = f"""You are an expert technical writer.
+
+Rewrite the following transcript into a PROFESSIONAL, WEB-READY ARTICLE.
+
+Rules:
+- DO NOT copy transcript sentences directly
+- REMOVE spoken phrases, greetings, and fillers
+- REMOVE repetitions
+- Use formal article language
+- Use clear paragraphs
+- Keep it around 1100–1300 words
+- Plain text only (no headings, no bullets, no numbering)
+- Do NOT include references, links, citations, or keywords list
+
+Transcript:
+\"\"\"
+{transcript[:5000]}
+\"\"\"
+"""
+            
+            try:
+                response = client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[
+                        {"role": "system", "content": "You are an expert technical writer who creates professional, web-ready articles."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.7,
+                    max_tokens=2500  # Allow enough for 1100-1300 words
+                )
+                article_raw = response.choices[0].message.content.strip()
+            except Exception as e:
+                raise RuntimeError(f"OpenAI article generation failed: {e}")
+        else:
+            # Use Groq (faster)
+            import requests
+            headers = {
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            
+            prompt = f"""You are an expert technical writer.
+
+Rewrite the following transcript into a PROFESSIONAL, WEB-READY ARTICLE.
+
+Rules:
+- DO NOT copy transcript sentences directly
+- REMOVE spoken phrases, greetings, and fillers
+- REMOVE repetitions
+- Use formal article language
+- Use clear paragraphs
+- Keep it around 1100–1300 words
+- Plain text only (no headings, no bullets, no numbering)
+- Do NOT include references, links, citations, or keywords list
+
+Transcript:
+\"\"\"
+{transcript[:5000]}
+\"\"\"
+"""
+            
+            payload = {
+                "model": GROQ_MODEL,
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.7,
+                "max_tokens": 2500
+            }
+            
+            try:
+                # ✅ Use retry wrapper with exponential backoff
+                response = groq_post_with_retry(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers,
+                    payload=payload,
+                    timeout=60
+                )
+                result = response.json()
+                article_raw = result["choices"][0]["message"]["content"].strip()
+            except Exception as e:
+                raise RuntimeError(f"Groq article generation failed: {e}")
+        
+        # ✅ CLEAN: Remove any model instructions/messages from the article (e.g., "Perfect! Let's trim...")
+        # Remove common model response patterns that aren't part of the article
+        article_raw = re.sub(r'^(Perfect!.*?words.*?intact\.\s*)', '', article_raw, flags=re.IGNORECASE | re.MULTILINE)
+        article_raw = re.sub(r'^(Let\'s trim.*?words.*?intact\.\s*)', '', article_raw, flags=re.IGNORECASE | re.MULTILINE)
+        article_raw = re.sub(r'^(I\'ll trim.*?words.*?intact\.\s*)', '', article_raw, flags=re.IGNORECASE | re.MULTILINE)
+        article_raw = article_raw.strip()
+        
+        # ✅ VALIDATE: Check article quality (mandatory)
+        if is_valid_article(article_raw):
+            # Article is valid, proceed to trim
+            break
+        else:
+            # Article failed validation, regenerate
+            if attempt < max_regeneration_attempts - 1:
+                print(f"   ⚠️ Article validation failed (attempt {attempt + 1}/{max_regeneration_attempts}), regenerating...")
+                continue
+            else:
+                print(f"   ⚠️ Article validation failed after {max_regeneration_attempts} attempts, using anyway (may contain spoken phrases)")
+                # Use the article anyway if all attempts failed
+    
+    # ✅ MANDATORY: Trim to exactly 1200 words (auto-pad with transcript if too short, never exceed 1200)
+    article_text = trim_to_words(article_raw, 1200, pad_source=transcript)
+    print(f"✅ Generated article: {len(article_text.split())} words (trimmed from {len(article_raw.split())})")
+    return article_text
+
+def clean_article_text(raw: str) -> str:
+    """
+    Removes page headers like [MongoDB], extra blank lines, and any leftover reference markers.
+    Keeps plain paragraph text only.
+    
+    Args:
+        raw: Raw article text with headers and formatting
+        
+    Returns:
+        Cleaned article text without headers or extra formatting
+    """
+    if not raw:
+        return ""
+
+    text = raw.strip()
+
+    # Remove bracket headers like: [MongoDB] at start of lines
+    text = re.sub(r"^\[[^\]]+\]\s*", "", text, flags=re.MULTILINE)
+
+    # Remove multiple blank lines (3+ becomes 2)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
+
+
+def call_openai_with_backoff(fn, max_retries: int = 4):
+    """
+    Wrapper for OpenAI API calls with exponential backoff for rate limits (429 errors).
+    
+    Args:
+        fn: Function to call (should return the result or raise an exception)
+        max_retries: Maximum number of retry attempts
+        
+    Returns:
+        Result from fn()
+        
+    Raises:
+        RuntimeError: If all retries are exhausted
+    """
+    wait = 2  # Initial wait time in seconds
+    for i in range(max_retries):
+        try:
+            return fn()
+        except Exception as e:
+            msg = str(e).lower()
+            # Check for rate limit errors (429) or quota issues
+            if "429" in msg or "rate limit" in msg or "quota" in msg:
+                if i < max_retries - 1:
+                    print(f"   ⚠️ OpenAI rate limit (attempt {i + 1}/{max_retries}), waiting {wait}s...")
+                    time.sleep(wait)
+                    wait = min(wait * 2, 30)  # Exponential backoff, max 30s
+                    continue
+            # For other errors, re-raise immediately
+            raise
+    raise RuntimeError("OpenAI: retries exhausted after rate limit errors")
+
+def build_article_with_openai(topic_terms: List[str], wiki_blocks: List[Dict[str, str]], target_words: int = 1200) -> str:
+    """
+    Synthesize a cohesive article from Wikipedia snippets using OpenAI.
+    
+    Args:
+        topic_terms: List of topic terms to stay within scope
+        wiki_blocks: List of dicts with 'title' and 'text' keys from Wikipedia
+        target_words: Target word count for the synthesized article (default: 1200, max: 1200)
+        
+    Returns:
+        Synthesized article text (900-1100 words)
+        
+    Raises:
+        RuntimeError: If OpenAI is not configured or API call fails
+    """
+    if not OPENAI_AVAILABLE:
+        raise RuntimeError("OpenAI SDK not installed. Install with: pip install openai")
+    
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not configured. Set OPENAI_API_KEY environment variable.")
+    
+    if not wiki_blocks or len(wiki_blocks) == 0:
+        raise ValueError("wiki_blocks cannot be empty")
+    
+    # Build sources text from wiki_blocks
+    sources_text = "\n\n".join([f"[{b['title']}]\n{b['text']}" for b in wiki_blocks])
+    
+    prompt = f"""You are writing a clean study article for learners.
+
+Topic terms (must stay within these): {", ".join(topic_terms)}
+
+You are given multiple source snippets below. Write a NEW article (do not copy sentences verbatim),
+synthesizing the ideas into a cohesive primer.
+
+Hard rules:
+- Stay strictly on-topic. Do NOT introduce unrelated brands/apps (e.g., Google Maps, Excel, Chrome) unless central to the topic.
+- Length: {target_words} words (±10%).
+- Structure: short intro + 4–6 sections with headings + short conclusion.
+- Use simple language, but accurate.
+- Do NOT include citations/URLs in the output.
+
+SOURCE SNIPPETS:
+{sources_text}
+""".strip()
+    
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    
+    def make_openai_call():
+        # Use chat completions API (standard OpenAI API)
+        # Note: Uses Chat Completions API. For structured outputs, you can add response_format parameter.
+        try:
+            response = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are a technical writer who creates clear, educational articles."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7,
+                max_tokens=int(target_words * 1.5)  # Allow enough tokens for target word count
+            )
+            article = response.choices[0].message.content.strip()
+            if not article:
+                raise ValueError("OpenAI returned empty article")
+            return article
+        except Exception as e:
+            # Re-raise to be caught by backoff handler
+            # OpenAI SDK raises specific exceptions, but we'll handle rate limits generically
+            error_msg = str(e).lower()
+            # Check for rate limit or quota errors (429, rate_limit, quota)
+            if "429" in error_msg or "rate limit" in error_msg or "quota" in error_msg or "rate_limit" in error_msg:
+                raise  # Let backoff handler deal with it
+            # For other errors, also raise (backoff won't retry non-rate-limit errors)
+            raise
+    
+    try:
+        print(f"   🤖 Synthesizing article with OpenAI ({OPENAI_MODEL})...")
+        article = call_openai_with_backoff(make_openai_call, max_retries=4)
+        word_count = len(article.split())
+        print(f"   ✅ OpenAI synthesized article: {word_count} words")
+        return article
+    except Exception as e:
+        print(f"   ⚠️ OpenAI article synthesis failed: {e}")
+        raise
+
+def generate_web_search_questions(article_text: str, chunk_questions: List[Dict[str, Any]], video_duration: float) -> Tuple[List[Dict[str, Any]], str]:
+    """
+    ✅ FIXED: Generate 10 MCQs ONLY from article_text (no transcript, no Wikipedia).
+    
+    Args:
+        article_text: Article text (exactly 1200 words, max 1200)
+        chunk_questions: List of 5 existing chunk questions (to avoid overlap)
+        video_duration: Total video duration in seconds
+        
+    Returns:
+        Tuple of (list of 10 question dictionaries, article_text)
+    """
+    if not GROQ_API_KEY:
+        print("⚠️ GROQ_API_KEY not configured. Skipping web search questions.")
+        return [], article_text
+    
+    try:
+        import requests
+    except ImportError:
+        print("⚠️ requests library not installed. Skipping web search questions.")
+        return [], article_text
+    
+    # ✅ Simple validation: no topic hits, no Wikipedia checks
+    def is_valid(q):
+        question_text = (q.get("question") or q.get("q") or "").strip()
+        options = q.get("options") or {}
+        answer = (q.get("correct_answer") or q.get("answer") or "").strip().upper()
+        
+        if not question_text or len(question_text) < 10:
+            return False
+        
+        if not isinstance(options, dict) or answer not in ["A", "B", "C", "D"]:
+            return False
+        
+        # Check all 4 options exist
+        normalized_options = {}
+        for key in ["A", "B", "C", "D"]:
+            opt_text = str(options.get(key, "")).strip()
+            if not opt_text:
+                return False
+            normalized_options[key] = opt_text
+        
+        # Check options are unique
+        option_values_lower = [opt.lower().strip() for opt in normalized_options.values()]
+        if len(option_values_lower) != len(set(option_values_lower)):
+            return False
+        
+        # Check correct answer exists in options
+        if answer not in normalized_options:
+            return False
+        
+        return True
+    
+    # ✅ STRICT LIMITS: Groq requires very small inputs
+    MAX_TOKENS_INPUT = 2500   # STRICT limit
+    MAX_CHARS = 3000          # Safe character limit
+    
+    # ✅ Trim article to strict limit
+    article_for_questions = article_text[:MAX_CHARS]
+    if len(article_text) > MAX_CHARS:
+        print(f"   ⚠️ Article trimmed from {len(article_text)} to {MAX_CHARS} chars (strict Groq limit)")
+    
+    # ✅ PROMPT: Force strict JSON output (explicit format requirements)
+    user_prompt = f"""Generate exactly 10 web search questions from the following article.
+
+CRITICAL REQUIREMENTS:
+- Return ONLY a JSON array, nothing else
+- No explanations, no extra text, no notes
+- Each object must have: question, options (A/B/C/D), correct_answer
+- Valid JSON format only
+
+Required JSON structure:
+[
+  {{
+    "question": "The question text?",
+    "options": {{"A": "Option A", "B": "Option B", "C": "Option C", "D": "Option D"}},
+    "correct_answer": "A"
+  }}
+]
+
+Article:
+\"\"\"
+{article_for_questions}
+\"\"\"
+
+Return ONLY the JSON array:"""
+    
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    target_count = 10
+    warnings = []
+    
+    try:
+        print(f"🤖 Generating {target_count} web search questions from article (single request, strict limits)...")
+        
+        # ✅ Auto-detect available model or use configured/default
+        web_model = None
+        
+        # Try environment variable first
+        if os.getenv("GROQ_WEB_MODEL"):
+            web_model = os.getenv("GROQ_WEB_MODEL")
+            print(f"   📌 Using model from GROQ_WEB_MODEL: {web_model}")
+        else:
+            # Auto-detect available models
+            available_models = get_available_groq_models()
+            if available_models:
+                # Prefer groq/compound-mini if available, otherwise use first available
+                if "groq/compound-mini" in available_models:
+                    web_model = "groq/compound-mini"
+                else:
+                    web_model = available_models[0]
+                print(f"   📌 Auto-detected available model: {web_model}")
+            else:
+                # Fallback to default (most widely available)
+                web_model = "groq/compound-mini"
+                print(f"   📌 Using default model: {web_model}")
+        
+        # ✅ Validate model before creating payload (catch deprecated models early)
+        try:
+            validate_groq_model(web_model)
+        except RuntimeError:
+            # If validation fails but model starts with groq/, allow it (might be new model)
+            if not web_model.startswith("groq/"):
+                raise
+            print(f"   ⚠️ Model {web_model} not in supported list, but allowing (groq/* format)")
+        
+        # ✅ PAYLOAD: With system message for better structure
+        payload = {
+            "model": web_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are an assistant that generates clear web search questions."
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt
+                }
+            ],
+            "temperature": 0.3
+        }
+        
+        # ✅ DEBUG: Log payload size to catch token overflow issues
+        payload_json = json.dumps(payload)
+        payload_size = len(payload_json)
+        print(f"   📊 Payload size: {payload_size:,} characters")
+        if payload_size > 4000:
+            print(f"   ⚠️ WARNING: Payload size ({payload_size:,}) exceeds safe limit")
+        
+        # ✅ Use retry wrapper with exponential backoff
+        response = groq_post_with_retry(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            payload=payload,
+            timeout=60
+        )
+        
+        result = response.json()
+        content = result["choices"][0]["message"]["content"].strip()
+        
+        # Extract JSON from response using tolerant parser
+        try:
+            # Try tolerant parser first
+            data = parse_tolerant_json(content)
+            print(f"   ✅ Successfully parsed JSON from model response")
+        except Exception as e:
+            print(f"   ⚠️ Tolerant parser failed: {e}")
+            print(f"   📄 Raw response preview: {content[:200]}...")
+            # Try fallback parser
+            try:
+                data = safe_json_extract(content)
+                print(f"   ✅ Fallback parser succeeded")
+            except Exception as e2:
+                print(f"   ❌ All JSON parsers failed: {e2}")
+                warnings.append(f"Failed to extract JSON from response: {e2}")
+                return [], article_text
+        
+        # Parse questions
+        questions_list = None
+        if isinstance(data, list):
+            questions_list = data
+        elif isinstance(data, dict):
+            if "questions" in data and isinstance(data["questions"], list):
+                questions_list = data["questions"]
+            elif "mcqs" in data and isinstance(data["mcqs"], list):
+                questions_list = data["mcqs"]
+        
+        if not questions_list:
+            print(f"   ⚠️ No questions found in response")
+            warnings.append("No questions found in API response")
+            return [], article_text
+        
+        # ✅ Validate all questions
+        validated_questions = [q for q in questions_list if is_valid(q)]
+        
+        # Check for duplicates with chunk questions
+        chunk_question_texts = {q.get("question", "").lower().strip() for q in chunk_questions}
+        validated_questions = [
+            q for q in validated_questions 
+            if q.get("question", "").lower().strip() not in chunk_question_texts
+        ]
+        
+        # ✅ Handle partial success gracefully
+        if len(validated_questions) < target_count:
+            warnings.append(f"Generated {len(validated_questions)}/{target_count} questions (partial success)")
+            print(f"   ⚠️ Generated {len(validated_questions)}/{target_count} valid questions")
+        else:
+            validated_questions = validated_questions[:target_count]
+            print(f"   ✅ Generated {len(validated_questions)} valid questions")
+        
+        # Format questions
+        formatted_questions = []
+        for q in validated_questions:
+            question_text = (q.get("question") or q.get("q") or "").strip()
+            options = q.get("options") or {}
+            answer = (q.get("correct_answer") or q.get("answer") or "").strip().upper()
+            
+            normalized_options = {}
+            for key in ["A", "B", "C", "D"]:
+                normalized_options[key] = str(options.get(key, "")).strip()
+            
+            formatted_questions.append({
+                "question": question_text,
+                "options": normalized_options,
+                "correct_answer": answer,
+                "explanation": q.get("explanation", ""),
+                "timestamp_seconds": round(video_duration, 2),
+                "timestamp": seconds_to_mmss(video_duration),
+                "anchor_type": "WEB_SEARCH",
+                "question_index": 0,  # Will be set when appending
+            })
+        
+        if warnings:
+            print(f"⚠️ Warnings: {'; '.join(warnings)}")
+        
+        if len(formatted_questions) > 0:
+            print(f"✅ Generated {len(formatted_questions)} web search questions from article")
+        else:
+            print(f"⚠️ No web search questions generated")
+        
+        return formatted_questions, article_text
+        
+    except RuntimeError as e:
+        # ✅ Handle rate limit errors gracefully (return partial success)
+        if "rate limit" in str(e).lower() or "429" in str(e):
+            print(f"⚠️ Rate limit hit while generating web questions: {e}")
+            print(f"   Returning {len(formatted_questions) if 'formatted_questions' in locals() else 0} partial questions")
+            return formatted_questions if 'formatted_questions' in locals() else [], article_text
+        raise
+    except Exception as e:
+        print(f"⚠️ Error generating web search questions: {e}")
+        traceback.print_exc()
+        # ✅ Return partial results if we have any
+        if 'formatted_questions' in locals() and len(formatted_questions) > 0:
+            print(f"   Returning {len(formatted_questions)} partial questions")
+            return formatted_questions, article_text
+        return [], article_text
 
 # ===============================
 # REQUEST MODELS
@@ -590,6 +2802,234 @@ class MCQRequest(BaseModel):
     randomize: bool = Field(default=True, description="Shuffle questions")
     limit: int = Field(default=20, ge=1, le=50, description="Number of questions to return")
     force: bool = Field(default=False, description="Force regeneration even if cached (useful for testing exam-grade mode)")
+    video_ended: bool = Field(default=True, description="Whether the video has ended (defaults to True to always generate 10 web search questions at video end)")
+
+# ===============================
+# PRODUCT MODELS (MongoDB)
+# ===============================
+class MCQOption(BaseModel):
+    A: str
+    B: str
+    C: str
+    D: str
+
+class MCQuestion(BaseModel):
+    question: str
+    options: MCQOption
+    correct_answer: str
+
+class ProductResponse(BaseModel):
+    product_id: str
+    description: str
+
+class ProductMCQResponse(BaseModel):
+    product_id: str
+    description: str
+    mcq_questions: List[MCQuestion]
+
+class ProductMCQRequest(BaseModel):
+    product_id: str
+
+# ===============================
+# CONTENT SAFETY CHECK MODELS
+# ===============================
+class ContentSafetyCheckRequest(BaseModel):
+    video_url: str = Field(..., description="Video URL to check for content safety")
+    force_recheck: bool = Field(default=False, description="Force re-check even if cached result exists")
+
+class ContentSafetyCheckResponse(BaseModel):
+    status: str = Field(..., description="Status: 'success' or 'error'")
+    video_id: str = Field(..., description="Unique video identifier")
+    video_url: str = Field(..., description="Video URL that was checked")
+    cached: bool = Field(..., description="Whether result was from cache")
+    content_safety: dict = Field(..., description="Safety classification result")
+    time_seconds: Optional[float] = Field(None, description="Time taken for classification (if not cached)")
+
+# ===============================
+# PRODUCT HELPER FUNCTIONS (MongoDB)
+# ===============================
+async def get_product_from_mongo(product_id: str) -> dict:
+    """Fetch product from MongoDB"""
+    if products_collection is None:
+        raise HTTPException(status_code=503, detail="MongoDB not configured. Set MONGO_URI environment variable.")
+    
+    try:
+        # Try to find by ObjectId first
+        try:
+            object_id = ObjectId(product_id)
+            product = await products_collection.find_one({"_id": object_id})
+        except:
+            # If not valid ObjectId, try to find by product_id field
+            product = await products_collection.find_one({"product_id": product_id})
+        
+        if not product:
+            raise HTTPException(status_code=404, detail=f"Product with ID {product_id} not found")
+        
+        # Convert ObjectId to string for JSON serialization
+        if "_id" in product:
+            product["_id"] = str(product["_id"])
+        
+        # Extract product_id and description
+        final_product = {
+            "product_id": product.get("product_id", str(product.get("_id", ""))),
+            "description": product.get("description", "")
+        }
+        
+        if not final_product["description"]:
+            raise HTTPException(status_code=400, detail="Product description not found")
+        
+        return final_product
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+def safe_json_extract_product(text: str):
+    """
+    ✅ FIXED: Robust JSON extractor that handles Groq responses with extra text.
+    Finds JSON array/object even if surrounded by markdown or other text.
+    """
+    text = text.strip()
+    
+    # Remove markdown code blocks
+    text = re.sub(r"```json\s*", "", text)
+    text = re.sub(r"```\s*", "", text)
+    text = text.strip()
+    
+    # Try to find JSON array first (for MCQ responses)
+    array_match = re.search(r"\[\s*{.*}\s*\]", text, re.DOTALL)
+    if array_match:
+        js = array_match.group(0)
+        js = re.sub(r"[\x00-\x1F\x7F]", "", js)  # Remove control characters
+        js = re.sub(r",\s*}", "}", js)  # Fix trailing commas
+        js = re.sub(r",\s*]", "]", js)
+        try:
+            return json.loads(js)
+        except json.JSONDecodeError:
+            pass
+    
+    # Fallback to object extraction
+    a = text.find("{")
+    b = text.rfind("}")
+    if a != -1 and b > a:
+        js = text[a:b + 1]
+        js = re.sub(r"[\x00-\x1F\x7F]", "", js)
+        js = re.sub(r",\s*}", "}", js)
+        js = re.sub(r",\s*]", "]", js)
+        try:
+            return json.loads(js)
+        except json.JSONDecodeError:
+            pass
+    
+    raise ValueError("No valid JSON array or object found in response")
+
+
+def generate_product_mcq_with_groq(description: str) -> List[dict]:
+    """Generate 5 MCQ questions using Groq AI for products"""
+    
+    if not GROQ_API_KEY:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY not configured")
+    
+    prompt = f"""Based on the following product description, generate exactly 5 multiple choice questions (MCQ) with 4 options each (A, B, C, D).
+
+Product Description:
+{description}
+
+Return the response in this exact JSON format:
+[
+  {{
+    "question": "Question text here?",
+    "options": {{
+      "A": "Option A text",
+      "B": "Option B text",
+      "C": "Option C text",
+      "D": "Option D text"
+    }},
+    "correct_answer": "A"
+  }}
+]
+
+Rules:
+1. Generate exactly 5 questions
+2. Questions should be relevant and based on the product description
+3. Include technical specifications where applicable
+4. Each question must have exactly 4 options (A, B, C, D)
+5. Specify the correct answer (A, B, C, or D)
+6. Make questions educational and informative
+7. Return ONLY the JSON array, no additional text or markdown
+"""
+
+    try:
+        import requests
+        
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": "llama-3.3-70b-versatile",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are an expert at creating educational MCQ questions. Always respond with valid JSON only, no markdown formatting."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.7,
+            "max_tokens": 2000
+        }
+        
+        # ✅ Use retry wrapper with exponential backoff
+        response = groq_post_with_retry(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            payload=payload,
+            timeout=60
+        )
+        
+        result = response.json()
+        response_text = result["choices"][0]["message"]["content"].strip()
+        
+        # Use safe JSON extractor to handle extra text
+        mcq_list = safe_json_extract_product(response_text)
+        
+        # Validate that we have a list
+        if not isinstance(mcq_list, list):
+            raise ValueError(f"Expected JSON array, got {type(mcq_list).__name__}")
+        
+        # Validate that we have exactly 5 questions
+        if len(mcq_list) != 5:
+            raise ValueError(f"Expected 5 questions, got {len(mcq_list)}")
+        
+        # Validate each question structure
+        for i, q in enumerate(mcq_list):
+            if not isinstance(q, dict):
+                raise ValueError(f"Question {i+1} is not a dictionary")
+            if "question" not in q:
+                raise ValueError(f"Question {i+1} missing 'question' field")
+            if "options" not in q or not isinstance(q["options"], dict):
+                raise ValueError(f"Question {i+1} missing or invalid 'options' field")
+            if "correct_answer" not in q:
+                raise ValueError(f"Question {i+1} missing 'correct_answer' field")
+            if q["correct_answer"] not in ["A", "B", "C", "D"]:
+                raise ValueError(f"Question {i+1} has invalid correct_answer: {q['correct_answer']}")
+            if set(q["options"].keys()) != {"A", "B", "C", "D"}:
+                raise ValueError(f"Question {i+1} must have exactly 4 options (A, B, C, D)")
+        
+        return mcq_list
+        
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=f"Validation error: {str(e)}")
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to parse Groq response: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Groq API error: {str(e)}")
 
 # ===============================
 # UTILS
@@ -725,17 +3165,119 @@ def deduplicate_questions(questions: list) -> list:
                 out.append(q)
     return out
 
-def safe_json_extract(s: str) -> dict:
-    s = s.strip().replace("```json", "").replace("```", "").strip()
-    a = s.find("{")
-    b = s.rfind("}")
-    if a == -1 or b <= a:
-        raise ValueError("No JSON object found in model output")
-    js = s[a:b + 1]
-    js = re.sub(r"[\x00-\x1F\x7F]", "", js)
-    js = re.sub(r",\s*}", "}", js)
-    js = re.sub(r",\s*]", "]", js)
-    return json.loads(js)
+def parse_tolerant_json(text: str):
+    """
+    ✅ TOLERANT JSON PARSER: Handles common model output issues.
+    
+    Fixes:
+    - Extra text before/after JSON
+    - Trailing commas
+    - Control characters
+    - Markdown code blocks
+    - Multiple JSON objects/arrays
+    
+    Args:
+        text: Raw model output text
+        
+    Returns:
+        Parsed JSON (list or dict)
+        
+    Raises:
+        ValueError: If no valid JSON can be extracted
+    """
+    if not text or not text.strip():
+        raise ValueError("Empty response from model")
+    
+    # Step 1: Remove markdown code blocks
+    text = re.sub(r"```json\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"```\s*", "", text)
+    text = text.strip()
+    
+    # Step 2: Try to find JSON array first (most common for questions)
+    # Look for array pattern: [ { ... } ] with multiple objects
+    # Use balanced bracket matching to find complete arrays
+    bracket_start = text.find('[')
+    if bracket_start != -1:
+        # Find matching closing bracket
+        bracket_count = 0
+        bracket_end = -1
+        for i in range(bracket_start, len(text)):
+            if text[i] == '[':
+                bracket_count += 1
+            elif text[i] == ']':
+                bracket_count -= 1
+                if bracket_count == 0:
+                    bracket_end = i
+                    break
+        
+        if bracket_end > bracket_start:
+            json_text = text[bracket_start:bracket_end + 1]
+            # Clean the JSON
+            json_text = re.sub(r'[\x00-\x1F\x7F]', '', json_text)  # Remove control chars
+            json_text = re.sub(r',(\s*[}\]])', r'\1', json_text)  # Remove trailing commas
+            
+            try:
+                parsed = json.loads(json_text)
+                if isinstance(parsed, list):
+                    return parsed
+            except json.JSONDecodeError as e:
+                # Try one more cleanup pass
+                json_text = re.sub(r',\s*([}\]])', r'\1', json_text)  # More aggressive trailing comma removal
+                try:
+                    parsed = json.loads(json_text)
+                    if isinstance(parsed, list):
+                        return parsed
+                except json.JSONDecodeError:
+                    pass
+    
+    # Step 3: Try to find JSON object
+    obj_start = text.find('{')
+    obj_end = text.rfind('}')
+    if obj_start != -1 and obj_end > obj_start:
+        json_text = text[obj_start:obj_end + 1]
+        json_text = re.sub(r'[\x00-\x1F\x7F]', '', json_text)
+        json_text = re.sub(r',(\s*[}\]])', r'\1', json_text)
+        
+        try:
+            return json.loads(json_text)
+        except json.JSONDecodeError:
+            pass
+    
+    raise ValueError("No valid JSON array or object found in model output")
+
+def safe_json_extract(s: str):
+    """
+    ✅ FIXED: Robust JSON extractor that handles both objects and arrays.
+    Uses tolerant parser for better error recovery.
+    """
+    try:
+        return parse_tolerant_json(s)
+    except ValueError:
+        # Fallback to original logic for backward compatibility
+        s = s.strip().replace("```json", "").replace("```", "").strip()
+        
+        # Try to find JSON array first (for web questions)
+        array_match = re.search(r"\[\s*{.*}\s*\]", s, re.DOTALL)
+        if array_match:
+            js = array_match.group(0)
+            js = re.sub(r"[\x00-\x1F\x7F]", "", js)
+            js = re.sub(r",\s*}", "}", js)
+            js = re.sub(r",\s*]", "]", js)
+            try:
+                return json.loads(js)
+            except json.JSONDecodeError:
+                pass
+        
+        # Fallback to object extraction (original behavior)
+        a = s.find("{")
+        b = s.rfind("}")
+        if a == -1 or b <= a:
+            raise ValueError("No JSON array or object found in model output")
+        js = s[a:b + 1]
+        js = re.sub(r"[\x00-\x1F\x7F]", "", js)
+        js = re.sub(r",\s*}", "}", js)
+        js = re.sub(r",\s*]", "]", js)
+        return json.loads(js)
 
 def strip_answers(qs: list) -> list:
     return [{"question": q["question"], "options": q["options"]} for q in qs]
@@ -2902,9 +5444,9 @@ def generate_mcqs_ollama_from_anchors(anchors: List[Dict[str, Any]], video_durat
 # ===============================
 # pipeline
 # ===============================
-def generate_mcqs_from_video_fast(video_url: str, use_anchors: Optional[bool] = None) -> Tuple[List[Dict[str, Any]], Optional[List[Dict[str, Any]]]]:
+def generate_mcqs_from_video_fast(video_url: str, use_anchors: Optional[bool] = None) -> Tuple[List[Dict[str, Any]], Optional[List[Dict[str, Any]]], str, List[Dict[str, Any]], float]:
     """
-    Main pipeline: Video → Transcript → Anchors → MCQs
+    Main pipeline: Video → Transcript → Safety Check → Anchors → MCQs
     
     Topic-Chunk mode (USE_TOPIC_CHUNK_MODE=True):
     - 3 topic chunks (0-35%, 35-70%, 70-100%)
@@ -2922,12 +5464,51 @@ def generate_mcqs_from_video_fast(video_url: str, use_anchors: Optional[bool] = 
     - Random important chunks
     - LLM decides everything
     
-    Returns: (questions_list, anchor_metadata_list_or_None)
+    Returns: (questions_list, anchor_metadata_list_or_None, transcript_text, transcript_segments, video_duration)
+    ✅ FIXED: Now returns transcript data to avoid double transcription
+    
+    Raises:
+        RuntimeError: If transcript is UNSAFE (blocks video processing)
     """
     if use_anchors is None:
         use_anchors = USE_ANCHOR_MODE
     
     transcript, transcript_segments, clip_timestamps, video_duration = transcribe_sampled_stream(video_url)
+    
+    # ✅ TRANSCRIPT SAFETY CHECK: Classify transcript before processing
+    print(f"🔍 Performing transcript safety check...")
+    try:
+        safety_result = classify_transcript_safety(transcript)
+        
+        verdict = safety_result.get("verdict", "UNCERTAIN").upper()
+        confidence = safety_result.get("confidence", 0.0)
+        category = safety_result.get("category", "unknown")
+        reason = safety_result.get("reason", "No reason provided")
+        needs_manual_review = safety_result.get("needs_manual_review", False)
+        
+        # Block video if UNSAFE
+        if verdict == "UNSAFE":
+            error_msg = (
+                f"Video transcript classified as UNSAFE. "
+                f"Category: {category}, Confidence: {confidence:.2f}, Reason: {reason}"
+            )
+            print(f"❌ {error_msg}")
+            raise RuntimeError(error_msg)
+        
+        # Mark for manual review if confidence is low
+        if needs_manual_review:
+            print(f"⚠️ Transcript safety confidence ({confidence:.2f}) below threshold (0.6) - marked for manual review")
+            print(f"   Verdict: {verdict}, Category: {category}, Reason: {reason}")
+        else:
+            print(f"✅ Transcript safety check passed: {verdict} (confidence: {confidence:.2f}, category: {category})")
+            
+    except RuntimeError:
+        # Re-raise blocking errors (UNSAFE verdict)
+        raise
+    except Exception as e:
+        # Log but don't block on classification errors (fail open for availability)
+        print(f"⚠️ Transcript safety check failed: {e}")
+        print(f"   Continuing with video processing (fail-open policy)")
     
     # ✅ TOPIC-CHUNK MODE: Fast 3-chunk → 5 questions approach (ONLY MODE)
     if not USE_TOPIC_CHUNK_MODE:
@@ -2944,7 +5525,7 @@ def generate_mcqs_from_video_fast(video_url: str, use_anchors: Optional[bool] = 
     # (chunk 3 ensures max(T3, video_duration - 2))
     
     print(f"   ✅ Generated {len(questions)} questions from 3 topic chunks")
-    return questions, chunk_metadata
+    return questions, chunk_metadata, transcript, transcript_segments, video_duration
 
 # ===============================
 # QUALITY METRICS BUILDER (Exam-Grade)
@@ -3008,11 +5589,36 @@ async def db_get(session: AsyncSession, video_id: str) -> Optional[VideoMCQ]:
     r = await session.execute(q)
     return r.scalar_one_or_none()
 
-async def db_upsert(session: AsyncSession, video_id: str, url: str, questions: list, mode: str = "legacy", quality_metrics: Optional[Dict[str, Any]] = None, force_regeneration: bool = False):
+async def commit_with_retry(session: AsyncSession, retries: int = 3):
     """
-    Save MCQs with mode versioning, audit trails, and quality metrics.
+    ✅ FIX #1: Retry logic for MySQL deadlocks (error 1213).
+    MySQL expects you to retry deadlock errors - this is standard practice.
+    """
+    for attempt in range(retries):
+        try:
+            await session.commit()
+            return
+        except OperationalError as e:
+            error_str = str(e)
+            if "Deadlock found" in error_str or "1213" in error_str:
+                await session.rollback()
+                if attempt == retries - 1:
+                    print(f"⚠️ Deadlock retry exhausted after {retries} attempts")
+                    raise
+                wait_time = 0.2 * (attempt + 1)  # Exponential backoff: 0.2s, 0.4s, 0.6s
+                print(f"⚠️ Deadlock detected (attempt {attempt + 1}/{retries}), retrying in {wait_time:.1f}s...")
+                await asyncio.sleep(wait_time)
+            else:
+                # Not a deadlock - re-raise immediately
+                raise
+    raise RuntimeError(f"Failed to commit after {retries} attempts")
+
+async def db_upsert(session: AsyncSession, video_id: str, url: str, questions: list, mode: str = "legacy", quality_metrics: Optional[Dict[str, Any]] = None, content_safety: Optional[Dict[str, Any]] = None, force_regeneration: bool = False):
+    """
+    Save MCQs with mode versioning, audit trails, quality metrics, and content safety.
     mode: "exam-grade" or "legacy"
     quality_metrics: Optional dict with quality stats (rejection_rate, etc.)
+    content_safety: Optional dict with safety classification result (SAFE/UNSAFE/UNCERTAIN)
     force_regeneration: If True, allows overwriting existing exam-grade quality_metrics (explicit regeneration)
     """
     existing = await db_get(session, video_id)
@@ -3047,63 +5653,59 @@ async def db_upsert(session: AsyncSession, video_id: str, url: str, questions: l
             if anchor_types:
                 quality_metrics["anchor_distribution"] = anchor_types
 
+    # ✅ FIX #2: Use MySQL ON DUPLICATE KEY UPDATE for idempotent inserts
+    # This prevents deadlocks from concurrent inserts on the same video_id
+    
+    # Calculate schema version and generation count
+    schema_ver = "1.0"
+    if quality_metrics and "schema_version" in quality_metrics:
+        schema_ver = quality_metrics["schema_version"]
+    
+    gen_count = 1
     if existing:
-        # Update existing record
+        # Update existing: increment generation_count for exam-grade mode
+        if mode == "exam-grade":
+            gen_count = (existing.generation_count or 0) + 1
+        else:
+            gen_count = existing.generation_count or 1
         
         # CRITICAL FIX #3: quality_metrics is append-only for exam-grade (never mutable)
         # Protection: Only prevent overwrite if exam-grade quality_metrics exists AND we're not doing explicit regeneration
-        # Allow update for: new records, legacy mode, legacy->exam-grade upgrade, or explicit regeneration (force_regeneration=True)
         if existing.quality_metrics and mode == "exam-grade" and existing.generation_mode == "exam-grade" and not force_regeneration:
             # Preserve existing quality_metrics - do not overwrite (prevents accidental mutation)
-            # Note: force_regeneration=True allows explicit regenerations to update quality_metrics
-            pass  # quality_metrics remains unchanged
-        else:
-            # Allow update: this is either new content, legacy mode, upgrade, or explicit regeneration
-            existing.quality_metrics = quality_metrics
-        
-        existing.url = url
-        existing.mcq_count = len(questions)
-        existing.questions = payload_questions
-        existing.generator = generator
-        existing.generation_mode = mode
-        
-        # CRITICAL FIX #1: generation_count = number of full regeneration cycles of exam-grade content
-        # Increment ONLY when mode = exam-grade and regeneration is explicitly triggered
-        if mode == "exam-grade":
-            existing.generation_count = (existing.generation_count or 0) + 1
-        # Do NOT increment for legacy saves, cache hits, or read paths
-        
-        existing.updated_by = "api"  # Can be enhanced with actual user/auth info
-        
-        # CRITICAL FIX #2: schema_version in DB must match quality_metrics.schema_version
-        if quality_metrics and "schema_version" in quality_metrics:
-            existing.schema_version = quality_metrics["schema_version"]
-        else:
-            existing.schema_version = "1.0"  # Fallback for legacy
-    else:
-        # Create new record
-        # CRITICAL FIX #2: schema_version in DB must match quality_metrics.schema_version
-        schema_ver = "1.0"
-        if quality_metrics and "schema_version" in quality_metrics:
-            schema_ver = quality_metrics["schema_version"]
-        
-        # CRITICAL FIX #1: generation_count = 1 for new exam-grade, 1 for legacy (initial generation)
-        gen_count = 1
-        
-        row = VideoMCQ(
-            video_id=video_id,
-            url=url,
-            mcq_count=len(questions),
-            questions=payload_questions,
-            generator=generator,
-            generation_mode=mode,
-            quality_metrics=quality_metrics,
-            schema_version=schema_ver,
-            created_by="api",
-            updated_by="api",
-            generation_count=gen_count
-        )
-        session.add(row)
+            quality_metrics = existing.quality_metrics
+    
+    # Use MySQL INSERT ... ON DUPLICATE KEY UPDATE for atomic upsert
+    # This prevents deadlocks from concurrent inserts
+    stmt = insert(VideoMCQ).values(
+        video_id=video_id,
+        url=url,
+        mcq_count=len(questions),
+        questions=payload_questions,
+        generator=generator,
+        generation_mode=mode,
+        quality_metrics=quality_metrics,
+        schema_version=schema_ver,
+        created_by="api",
+        updated_by="api",
+        generation_count=gen_count
+    )
+    
+    # ON DUPLICATE KEY UPDATE - MySQL specific
+    stmt = stmt.on_duplicate_key_update(
+        url=stmt.inserted.url,
+        mcq_count=stmt.inserted.mcq_count,
+        questions=stmt.inserted.questions,
+        generator=stmt.inserted.generator,
+        generation_mode=stmt.inserted.generation_mode,
+        quality_metrics=stmt.inserted.quality_metrics,
+        schema_version=stmt.inserted.schema_version,
+        updated_by=stmt.inserted.updated_by,
+        generation_count=stmt.inserted.generation_count,
+        updated_at=func.current_timestamp()
+    )
+    
+    await session.execute(stmt)
 
 async def db_get_with_mode(session: AsyncSession, video_id: str, required_mode: Optional[str] = None) -> Optional[VideoMCQ]:
     """
@@ -3177,11 +5779,20 @@ async def generate_and_save(req: GenerateSaveRequest):
                     existing = None  # Force regeneration to trigger hybrid fill pipeline
                 else:
                     # Cache is valid - return it
+                    # Initialize content_safety with default values
+                    content_safety_default = {
+                        "overall_video_verdict": "UNCERTAIN",
+                        "overall_is_safe": None,
+                        "overall_is_unsafe": None,
+                        "overall_reason": "Classification in progress"
+                    }
+                    
                     response = {
                         "status": "cached",
                         "video_id": video_id,
                         "count": existing.mcq_count,
-                        "message": "Already generated. Use force=true to regenerate."
+                        "message": "Already generated. Use force=true to regenerate.",
+                        "content_safety": content_safety_default  # Always include
                     }
                     # Include questions if requested
                     if req.include_questions:
@@ -3191,6 +5802,46 @@ async def generate_and_save(req: GenerateSaveRequest):
                         if not req.include_answers:
                             qs = strip_answers(qs)
                         response["questions"] = qs
+                    
+                    # ✅ Check cache first for content safety classification
+                    cached_safety = existing.content_safety if existing and existing.content_safety else None
+                    if cached_safety:
+                        print(f"✅ Using cached content safety classification: {cached_safety.get('overall_video_verdict', 'UNKNOWN')}")
+                        response["content_safety"] = cached_safety
+                    else:
+                        # Try to classify video safety
+                        try:
+                            print(f"🔍 Starting content safety classification for cached video: {req.url[:80]}...")
+                            safety_result = await classify_video_safety(req.url, use_batch=True, num_frames=5)
+                            print(f"✅ Content safety classification completed: {safety_result.get('overall_video_verdict', 'UNKNOWN')}")
+                            safety_data = {
+                                "overall_video_verdict": safety_result.get("overall_video_verdict", "UNCERTAIN"),
+                                "overall_is_safe": safety_result.get("overall_is_safe", None),
+                                "overall_is_unsafe": safety_result.get("overall_is_unsafe", None),
+                                "overall_reason": safety_result.get("overall_reason", "")
+                            }
+                            response["content_safety"] = safety_data
+                            
+                            # ✅ SAVE: Update database with safety classification result
+                            print(f"💾 Saving content safety classification to database...")
+                            try:
+                                cached_mode = (existing.generator or {}).get("mode", "legacy")
+                                await db_upsert(session, video_id, req.url, qs, mode=cached_mode, quality_metrics=existing.quality_metrics, content_safety=safety_data, force_regeneration=False)
+                                await commit_with_retry(session)
+                                print(f"✅ Successfully saved content safety to database")
+                            except Exception as save_error:
+                                print(f"⚠️ Error saving content safety to database: {save_error}")
+                                # Continue even if save fails
+                        except Exception as e:
+                            print(f"⚠️ Error in content safety classification: {e}")
+                            traceback.print_exc()
+                            response["content_safety"] = {
+                                "overall_video_verdict": "UNCERTAIN",
+                                "overall_is_safe": None,
+                                "overall_is_unsafe": None,
+                                "overall_reason": f"Safety classification error: {str(e)[:100]}"
+                            }
+                    
                     return response
 
             t0 = time.time()
@@ -3215,7 +5866,7 @@ async def generate_and_save(req: GenerateSaveRequest):
             # ✅ FIX: Save to database with error handling
             try:
                 await db_upsert(session, video_id, req.url, qs, mode=detected_mode, quality_metrics=quality_metrics, force_regeneration=req.force)
-                await session.commit()
+                await commit_with_retry(session)
                 print(f"   ✅ Saved {len(qs)} questions to database (video_id: {video_id})")
             except Exception as db_error:
                 await session.rollback()
@@ -3224,11 +5875,20 @@ async def generate_and_save(req: GenerateSaveRequest):
                 raise HTTPException(status_code=500, detail=f"Failed to save questions to database: {str(db_error)}")
             dt = time.time() - t0
 
+            # Initialize content_safety with default values
+            content_safety_default = {
+                "overall_video_verdict": "UNCERTAIN",
+                "overall_is_safe": None,
+                "overall_is_unsafe": None,
+                "overall_reason": "Classification in progress"
+            }
+            
             response = {
                 "status": "saved",
                 "video_id": video_id,
                 "count": len(qs),
                 "time_seconds": round(dt, 2),
+                "content_safety": content_safety_default  # Always include
             }
             # Include questions if requested
             if req.include_questions:
@@ -3237,6 +5897,47 @@ async def generate_and_save(req: GenerateSaveRequest):
                 if not req.include_answers:
                     qs = strip_answers(qs)
                 response["questions"] = qs
+            
+            # ✅ Check cache first for content safety classification (after saving questions)
+            row_after_save = await db_get(session, video_id)
+            cached_safety = row_after_save.content_safety if row_after_save and row_after_save.content_safety else None
+            
+            if cached_safety:
+                print(f"✅ Using cached content safety classification: {cached_safety.get('overall_video_verdict', 'UNKNOWN')}")
+                response["content_safety"] = cached_safety
+            else:
+                # Try to classify video safety
+                try:
+                    print(f"🔍 Starting content safety classification for saved video: {req.url[:80]}...")
+                    safety_result = await classify_video_safety(req.url, use_batch=True, num_frames=5)
+                    print(f"✅ Content safety classification completed: {safety_result.get('overall_video_verdict', 'UNKNOWN')}")
+                    safety_data = {
+                        "overall_video_verdict": safety_result.get("overall_video_verdict", "UNCERTAIN"),
+                        "overall_is_safe": safety_result.get("overall_is_safe", None),
+                        "overall_is_unsafe": safety_result.get("overall_is_unsafe", None),
+                        "overall_reason": safety_result.get("overall_reason", "")
+                    }
+                    response["content_safety"] = safety_data
+                    
+                    # ✅ SAVE: Update database with safety classification result
+                    print(f"💾 Saving content safety classification to database...")
+                    try:
+                        await db_upsert(session, video_id, req.url, qs, mode=detected_mode, quality_metrics=quality_metrics, content_safety=safety_data, force_regeneration=req.force)
+                        await commit_with_retry(session)
+                        print(f"✅ Successfully saved content safety to database")
+                    except Exception as save_error:
+                        print(f"⚠️ Error saving content safety to database: {save_error}")
+                        # Continue even if save fails
+                except Exception as e:
+                    print(f"⚠️ Error in content safety classification: {e}")
+                    traceback.print_exc()
+                    response["content_safety"] = {
+                        "overall_video_verdict": "UNCERTAIN",
+                        "overall_is_safe": None,
+                        "overall_is_unsafe": None,
+                        "overall_reason": f"Safety classification error: {str(e)[:100]}"
+                    }
+            
             return response
         except Exception as e:
             await session.rollback()
@@ -3365,12 +6066,73 @@ async def get_mcqs(request: MCQRequest):
                 
                 # ✅ If cache was accepted (full or partial), return it
                 if row and 'qs2' in locals():
+                    # ✅ Check if web search questions already exist in cache (avoid double transcription)
+                    has_web_questions = any(q.get("anchor_type") == "WEB_SEARCH" for q in qs2)
+                    
+                    if has_web_questions:
+                        print("✅ Web search questions already in cache, skipping generation")
+                        article_text = ""  # No article needed if questions already exist
+                    else:
+                        # ✅ WEB SEARCH QUESTIONS: Generate from article (not transcript)
+                        print("🎬 Generating article and 10 web search questions...")
+                        article_text = ""  # Initialize article_text for cache path
+                        try:
+                            # ✅ FIX: Only transcribe once - get transcript and ACTUAL video duration
+                            print("📹 Getting video transcript for web search questions...")
+                            transcript, _, _, actual_video_duration = transcribe_sampled_stream(video_url)
+                            print(f"📹 Actual video duration: {actual_video_duration:.2f}s ({seconds_to_mmss(actual_video_duration)})")
+                            
+                            # ✅ FIXED: Generate article from transcript (exactly 1200 words, max 1200)
+                            print("📝 Generating article from transcript...")
+                            article_text = generate_article_from_transcript(transcript)
+                        
+                            # ✅ THROTTLING: Add delay after article generation to respect Groq rate limits
+                            print("⏱️ Throttling: Waiting 1.5s after article generation...")
+                            time.sleep(1.5)
+                            
+                            # ✅ FIXED: Generate 10 web questions from article only (not transcript)
+                            web_search_questions, article_text = generate_web_search_questions(article_text, qs2, actual_video_duration)
+                            
+                            if web_search_questions:
+                                print(f"✅ Generated {len(web_search_questions)} web search questions (separate from {len(qs2)} cached questions)")
+                                # Update question_index to be sequential after existing questions
+                                base_index = len(qs2)
+                                for idx, q in enumerate(web_search_questions):
+                                    q["question_index"] = base_index + idx + 1
+                                # Append web search questions to cached questions
+                                qs2.extend(web_search_questions)
+                                
+                                # ✅ SAVE: Update database with complete question list (including web search questions)
+                                print(f"💾 Saving {len(qs2)} total questions (including {len(web_search_questions)} web search) to database...")
+                                try:
+                                    # Get current mode from cached row
+                                    cached_mode = (row.generator or {}).get("mode", "legacy")
+                                    await db_upsert(session, video_id, video_url, qs2, mode=cached_mode, quality_metrics=row.quality_metrics, content_safety=row.content_safety, force_regeneration=False)
+                                    await commit_with_retry(session)
+                                    print(f"✅ Successfully saved {len(qs2)} questions to database")
+                                except Exception as e:
+                                    print(f"⚠️ Error saving questions to database: {e}")
+                                    traceback.print_exc()
+                                    # Continue even if save fails
+                            else:
+                                print("⚠️ No web search questions generated")
+                        except Exception as e:
+                            print(f"⚠️ Error generating article/web questions: {e}")
+                            traceback.print_exc()
+                            # Continue without web search questions if generation fails
+                    
                     # ✅ Apply sorting BEFORE randomize/limit (cache path)
+                    # Note: Sorting by timestamp keeps questions in chronological order
+                    # Cached questions (with timestamps during video) come first
+                    # Web search questions (with timestamps at video end) come after
                     qs2 = normalize_question_order(qs2)
                     
                     if request.randomize:
                         random.shuffle(qs2)
                     qs2 = qs2[:min(request.limit, len(qs2))]
+                    
+                    # ✅ FINAL SORT: Always sort by timestamp in final response (topic chunks first, web search last)
+                    qs2.sort(key=lambda q: q.get("timestamp_seconds", float('inf')))
                     
                     # Collect anchor type statistics (for exam-grade mode)
                     anchor_stats = {}
@@ -3388,7 +6150,8 @@ async def get_mcqs(request: MCQRequest):
                         "count": len(qs2),
                         "cached": True,
                         "mode": "exam-grade" if anchor_stats else "legacy",
-                        "questions": qs2
+                        "questions": qs2,
+                        "article_text": article_text if article_text else None
                     }
                     
                     # Add anchor statistics if available
@@ -3401,21 +6164,36 @@ async def get_mcqs(request: MCQRequest):
             # Not in cache - generate MCQs
             print(f"🔄 Generating MCQs in {current_mode} mode...")
             t0 = time.time()
-            qs, anchor_metadata = generate_mcqs_from_video_fast(video_url)
+            # ✅ FIXED: Reuse transcript from generate_mcqs_from_video_fast to avoid double transcription
+            qs, anchor_metadata, transcript_for_web, transcript_segments_for_web, actual_video_duration = generate_mcqs_from_video_fast(video_url)
             
-            # Get video duration for response (from first question timestamp or calculate)
-            video_duration = None
-            if qs and len(qs) > 0:
-                # Estimate from timestamps if available
+            # ✅ THROTTLING: Add delay after MCQ generation to respect Groq rate limits
+            print("⏱️ Throttling: Waiting 1.5s after MCQ generation...")
+            time.sleep(1.5)
+            
+            # ✅ FIXED: Transcript already available from generate_mcqs_from_video_fast (no need to transcribe again)
+            print(f"📹 Actual video duration: {actual_video_duration:.2f}s ({seconds_to_mmss(actual_video_duration)})")
+            
+            # ✅ FIX #3: Generate article AFTER acquiring lock but BEFORE opening DB transaction
+            # This reduces transaction length - don't hold DB lock during AI work
+            print("📝 Generating article from transcript...")
+            try:
+                article_text = generate_article_from_transcript(transcript_for_web)
+                
+                # ✅ THROTTLING: Add delay after article generation to respect Groq rate limits
+                print("⏱️ Throttling: Waiting 1.5s after article generation...")
+                time.sleep(1.5)
+            except Exception as e:
+                print(f"⚠️ Error generating article: {e}")
+                traceback.print_exc()
+                article_text = ""
+            
+            # If we still don't have duration, estimate from question timestamps (but don't add buffer)
+            if actual_video_duration is None and qs and len(qs) > 0:
                 timestamps = [q.get("timestamp_seconds", 0) for q in qs if q.get("timestamp_seconds")]
                 if timestamps:
-                    video_duration = max(timestamps) * 1.2  # Add 20% buffer
-                else:
-                    # Fallback: get duration from video URL
-                    try:
-                        video_duration = ffprobe_duration_seconds(video_url)
-                    except:
-                        pass
+                    actual_video_duration = max(timestamps)  # Use max timestamp, no buffer
+                    print(f"📹 Estimated video duration from timestamps: {actual_video_duration:.2f}s ({seconds_to_mmss(actual_video_duration)})")
             
             # ✅ Validate all questions have valid anchor types (using ALLOWED_ANCHORS)
             # Ensure all questions have a valid anchor_type, defaulting missing ones to TOPIC_CHUNK for topic-chunk mode
@@ -3444,21 +6222,87 @@ async def get_mcqs(request: MCQRequest):
             generation_time = time.time() - t0
             quality_metrics = build_quality_metrics(anchor_metadata, qs, generation_time, detected_mode)
             
-            # Save with mode versioning and quality metrics
-            # force_regeneration=True because this is an explicit generation (force param or cache miss)
-            await db_upsert(session, video_id, video_url, qs, mode=detected_mode, quality_metrics=quality_metrics, force_regeneration=request.force)
-            await session.commit()
+            # ✅ FIX #3: Open DB transaction ONLY when ready to write (short transaction)
+            # ✅ FIX #4: Use application-level lock to prevent concurrent processing of same video_id
+            async with get_video_lock(video_id):
+                # Double-check cache after acquiring lock (another request might have generated it)
+                row_after_lock = await db_get_with_mode(session, video_id, required_mode=current_mode)
+                if row_after_lock and not request.force:
+                    cached_questions_after = (row_after_lock.questions or {}).get("questions", [])
+                    if isinstance(cached_questions_after, list) and len(cached_questions_after) >= MIN_USABLE_QUESTIONS:
+                        print(f"✅ Cache found after lock (another request generated it)")
+                        qs = cached_questions_after[:]
+                        detected_mode = (row_after_lock.generator or {}).get("mode", "legacy")
+                    else:
+                        # Save with mode versioning and quality metrics
+                        await db_upsert(session, video_id, video_url, qs, mode=detected_mode, quality_metrics=quality_metrics, force_regeneration=request.force)
+                        await commit_with_retry(session)
+                else:
+                    # Save with mode versioning and quality metrics
+                    await db_upsert(session, video_id, video_url, qs, mode=detected_mode, quality_metrics=quality_metrics, force_regeneration=request.force)
+                    await commit_with_retry(session)
+            
             dt = time.time() - t0
             print(f"✅ Generated {len(qs)} MCQs in {detected_mode} mode (took {dt:.2f}s)")
             
             # Process questions according to request
-            qs2 = qs[:]
+            qs2 = qs[:]  # Copy existing 5 questions (don't modify original)
+            
+            # ✅ WEB SEARCH QUESTIONS: Generate from article (not transcript)
+            print("🎬 Generating 10 web search questions from article...")
+            if article_text and actual_video_duration:
+                try:
+                    # ✅ FIXED: Generate 10 web questions from article only (not transcript)
+                    web_search_questions, article_text = generate_web_search_questions(article_text, qs2, actual_video_duration)
+                    
+                    if web_search_questions:
+                        print(f"✅ Generated {len(web_search_questions)} web search questions (separate from {len(qs2)} existing questions)")
+                        # Update question_index to be sequential after existing questions
+                        base_index = len(qs2)
+                        for idx, q in enumerate(web_search_questions):
+                            q["question_index"] = base_index + idx + 1
+                        # Append web search questions to existing questions
+                        qs2.extend(web_search_questions)
+                        
+                        # ✅ SAVE: Update database with complete question list (including web search questions)
+                        print(f"💾 Saving {len(qs2)} total questions (including {len(web_search_questions)} web search) to database...")
+                        try:
+                            # Rebuild quality metrics with updated question count
+                            updated_quality_metrics = build_quality_metrics(anchor_metadata, qs2, generation_time, detected_mode)
+                            # Get existing content_safety if available
+                            row_before_save = await db_get(session, video_id)
+                            existing_safety = row_before_save.content_safety if row_before_save and row_before_save.content_safety else None
+                            await db_upsert(session, video_id, video_url, qs2, mode=detected_mode, quality_metrics=updated_quality_metrics, content_safety=existing_safety, force_regeneration=request.force)
+                            await commit_with_retry(session)
+                            print(f"✅ Successfully saved {len(qs2)} questions to database")
+                        except Exception as e:
+                            print(f"⚠️ Error saving questions to database: {e}")
+                            traceback.print_exc()
+                            # Continue even if save fails
+                    else:
+                        print("⚠️ No web search questions generated")
+                except Exception as e:
+                    print(f"⚠️ Error generating web search questions: {e}")
+                    traceback.print_exc()
+                    # Continue without web search questions if generation fails
+            else:
+                if not article_text:
+                    print("⚠️ Cannot generate web search questions: article not available")
+                if not actual_video_duration:
+                    print("⚠️ Cannot generate web search questions: video duration not available")
+            
             # ✅ Apply sorting BEFORE randomize/limit (fresh generation path)
+            # Note: Sorting by timestamp keeps questions in chronological order
+            # The 5 existing questions (with timestamps during video) come first
+            # The 10 web search questions (with timestamps at video end) come after
             qs2 = normalize_question_order(qs2)
             
             if request.randomize:
                 random.shuffle(qs2)
             qs2 = qs2[:min(request.limit, len(qs2))]
+            
+            # ✅ FINAL SORT: Always sort by timestamp in final response (topic chunks first, web search last)
+            qs2.sort(key=lambda q: q.get("timestamp_seconds", float('inf')))
             
             # Recalculate anchor_stats for response (from filtered qs2)
             # ✅ HYBRID MODE: Count both exam-grade and legacy separately
@@ -3500,7 +6344,8 @@ async def get_mcqs(request: MCQRequest):
                     "mode": "hybrid",
                     "exam_grade_count": exam_grade_count,
                     "legacy_count": legacy_count_response,
-                    "questions": qs2
+                    "questions": qs2,
+                    "article_text": article_text if article_text else None
                 }
             elif is_partial:
                 response = {
@@ -3513,7 +6358,8 @@ async def get_mcqs(request: MCQRequest):
                     "cached": False,
                     "time_seconds": round(dt, 2),
                     "questions": qs2,
-                    "message": f"Video does not contain enough examinable concepts to generate {MCQ_COUNT} exam-grade MCQs"
+                    "message": f"Video does not contain enough examinable concepts to generate {MCQ_COUNT} exam-grade MCQs",
+                    "article_text": article_text if article_text else None
                 }
             else:
                 response = {
@@ -3523,7 +6369,8 @@ async def get_mcqs(request: MCQRequest):
                     "cached": False,
                     "time_seconds": round(dt, 2),
                     "mode": final_mode,
-                    "questions": qs2
+                    "questions": qs2,
+                    "article_text": article_text if article_text else None
                 }
             
             # Add anchor statistics if available (only valid exam-grade types)
@@ -3552,6 +6399,182 @@ async def fetch_mcqs_by_url(url: str = Query(...), req: FetchByUrlRequest = Fetc
         randomize=req.randomize,
         limit=req.limit,
     )
+
+@app.post("/content/safety-check", response_model=ContentSafetyCheckResponse)
+async def check_content_safety(request: ContentSafetyCheckRequest):
+    """
+    Dedicated endpoint for checking video content safety.
+    
+    This endpoint:
+    1. Checks database cache first (if available)
+    2. If not cached or force_recheck=true, runs safety classification
+    3. Saves result to database for future requests
+    4. Returns safety classification result
+    
+    **Request Body:**
+    - `video_url`: Video URL to check (required)
+    - `force_recheck`: Force re-check even if cached (default: false)
+    
+    **Response:**
+    - `status`: "success" or "error"
+    - `video_id`: Unique video identifier
+    - `video_url`: Video URL that was checked
+    - `cached`: Whether result was from cache
+    - `content_safety`: Safety classification result with:
+      - `overall_video_verdict`: "SAFE", "UNSAFE", or "UNCERTAIN"
+      - `overall_is_safe`: Boolean (true if SAFE)
+      - `overall_is_unsafe`: Boolean (true if UNSAFE)
+      - `overall_reason`: Short reason for the verdict
+    - `time_seconds`: Time taken (only if not cached)
+    
+    **Example Request:**
+    ```json
+    {
+      "video_url": "https://example.com/video.mp4",
+      "force_recheck": false
+    }
+    ```
+    
+    **Example Response:**
+    ```json
+    {
+      "status": "success",
+      "video_id": "abc123",
+      "video_url": "https://example.com/video.mp4",
+      "cached": true,
+      "content_safety": {
+        "overall_video_verdict": "SAFE",
+        "overall_is_safe": true,
+        "overall_is_unsafe": false,
+        "overall_reason": "No unsafe content detected"
+      },
+      "time_seconds": null
+    }
+    ```
+    """
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="DATABASE_URL not configured")
+    
+    # ✅ Validate GROQ_API_KEY before proceeding
+    if not GROQ_API_KEY or not GROQ_API_KEY.strip():
+        raise HTTPException(
+            status_code=500, 
+            detail="GROQ_API_KEY is not configured. Set it with: $env:GROQ_API_KEY='your_key_here' (PowerShell) or export GROQ_API_KEY='your_key_here' (Linux/Mac)"
+        )
+    
+    video_url = request.video_url
+    video_id = make_video_id(video_url)
+    
+    async with SessionLocal() as session:
+        try:
+            t0 = time.time()
+            
+            # Check cache first (unless force_recheck is true)
+            if not request.force_recheck:
+                row = await db_get(session, video_id)
+                if row and row.content_safety:
+                    print(f"✅ Using cached content safety for video_id: {video_id}")
+                    return ContentSafetyCheckResponse(
+                        status="success",
+                        video_id=video_id,
+                        video_url=video_url,
+                        cached=True,
+                        content_safety=row.content_safety,
+                        time_seconds=None
+                    )
+            
+            # Not cached or force_recheck - run safety classification
+            print(f"🔍 Starting content safety classification for video: {video_url[:80]}...")
+            print(f"   Video ID: {video_id}")
+            if request.force_recheck:
+                print(f"   ⚠️ Force recheck requested - ignoring cache")
+            
+            try:
+                safety_result = await classify_video_safety(video_url, use_batch=True, num_frames=5)
+                dt = time.time() - t0
+                
+                print(f"✅ Content safety classification completed: {safety_result.get('overall_video_verdict', 'UNKNOWN')}")
+                
+                # Build safety data
+                safety_data = {
+                    "overall_video_verdict": safety_result.get("overall_video_verdict", "UNCERTAIN"),
+                    "overall_is_safe": safety_result.get("overall_is_safe", None),
+                    "overall_is_unsafe": safety_result.get("overall_is_unsafe", None),
+                    "overall_reason": safety_result.get("overall_reason", "")
+                }
+                
+                # ✅ SAVE: Save safety classification to database
+                print(f"💾 Saving content safety classification to database...")
+                try:
+                    # Check if questions exist for this video (to preserve them)
+                    existing_row = await db_get(session, video_id)
+                    if existing_row:
+                        # Preserve existing questions and other data
+                        existing_questions = (existing_row.questions or {}).get("questions", [])
+                        existing_mode = (existing_row.generator or {}).get("mode", "legacy")
+                        await db_upsert(
+                            session, 
+                            video_id, 
+                            video_url, 
+                            existing_questions if existing_questions else [], 
+                            mode=existing_mode, 
+                            quality_metrics=existing_row.quality_metrics, 
+                            content_safety=safety_data, 
+                            force_regeneration=False
+                        )
+                    else:
+                        # No existing record - create new one with just safety data
+                        await db_upsert(
+                            session, 
+                            video_id, 
+                            video_url, 
+                            [], 
+                            mode="legacy", 
+                            quality_metrics=None, 
+                            content_safety=safety_data, 
+                            force_regeneration=False
+                        )
+                    await commit_with_retry(session)
+                    print(f"✅ Successfully saved content safety to database")
+                except Exception as save_error:
+                    print(f"⚠️ Error saving content safety to database: {save_error}")
+                    traceback.print_exc()
+                    # Continue even if save fails
+                
+                return ContentSafetyCheckResponse(
+                    status="success",
+                    video_id=video_id,
+                    video_url=video_url,
+                    cached=False,
+                    content_safety=safety_data,
+                    time_seconds=round(dt, 2)
+                )
+                
+            except Exception as e:
+                print(f"⚠️ Error in content safety classification: {e}")
+                traceback.print_exc()
+                
+                # Return error response
+                error_safety_data = {
+                    "overall_video_verdict": "UNCERTAIN",
+                    "overall_is_safe": None,
+                    "overall_is_unsafe": None,
+                    "overall_reason": f"Safety classification error: {str(e)[:100]}"
+                }
+                
+                return ContentSafetyCheckResponse(
+                    status="error",
+                    video_id=video_id,
+                    video_url=video_url,
+                    cached=False,
+                    content_safety=error_safety_data,
+                    time_seconds=round(time.time() - t0, 2)
+                )
+                
+        except Exception as e:
+            await session.rollback()
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/health")
 def health():
@@ -3623,16 +6646,45 @@ async def verify_video_saved(video_id: str):
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         }
 
+# ✅ IMPORTANT: Specific routes must come BEFORE parameterized routes
+# POST /product/mcq must come before GET /product/{product_id}
+# Otherwise FastAPI will match "mcq" as a product_id parameter
+@app.post("/product/mcq", response_model=ProductMCQResponse)
+async def post_product_mcq(request: ProductMCQRequest):
+    """Get product details with AI-generated MCQ questions (POST method)"""
+    
+    # Fetch product from MongoDB
+    product = await get_product_from_mongo(request.product_id)
+    
+    # Generate MCQ questions using Groq
+    mcq_questions = generate_product_mcq_with_groq(product["description"])
+    
+    return {
+        "product_id": product["product_id"],
+        "description": product["description"],
+        "mcq_questions": mcq_questions
+    }
+
+
+@app.get("/product/{product_id}", response_model=ProductResponse)
+async def get_product(product_id: str):
+    """Get product details by ID from MongoDB"""
+    product = await get_product_from_mongo(product_id) 
+    return product
+
+
 @app.get("/")
 def root():
     return {
-        "service": "Fast Video MCQ Generator + MySQL Cache",
+        "service": "Fast Video MCQ Generator + MySQL Cache + Product MCQ Generator",
         "primary_endpoint": "POST /videos/mcqs - Single endpoint, everything in body (no query params)",
         "endpoints": [
             "POST /videos/mcqs - [RECOMMENDED] Single endpoint, all params in JSON body",
             "POST /generate-and-save - Generate and save MCQs (returns video_id)",
             "GET /videos/{video_id}/mcqs - Fetch MCQs by video_id",
-            "POST /videos/mcqs/by-url - [DEPRECATED] Use POST /videos/mcqs instead"
+            "POST /videos/mcqs/by-url - [DEPRECATED] Use POST /videos/mcqs instead",
+            "GET /product/{product_id} - Get product details from MongoDB",
+            "POST /product/mcq - Get product with AI-generated MCQ questions"
         ],
         "note": "Generate once, then fetch from DB instantly. Use POST /videos/mcqs for simplest integration."
     }
@@ -3666,10 +6718,23 @@ if __name__ == "__main__":
     print(f"🔧 Mode: {'EXAM-GRADE' if USE_ANCHOR_MODE else 'LEGACY'}")
     print("=" * 60 + "\n")
     
+    # ✅ WATCHFILES RELOAD FIX: Do NOT use --reload when processing long videos
+    # When uvicorn --reload detects file changes (e.g., temp clips), it restarts mid-request
+    # This causes "2 times processing" logs even if code is correct.
+    # 
+    # For production/long video processing: Run WITHOUT --reload
+    #   uvicorn api_pg_mcq:app --host 0.0.0.0 --port 8000
+    # 
+    # For development: Use --reload but ensure temp files are outside project folder
+    #   (e.g., C:\temp\mcq_clips\ instead of inside project directory)
+    
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=8000,
+        port=9001,
         log_level="info"
+        # ✅ Note: --reload is NOT enabled here to prevent WatchFiles double-processing
+        # If you need auto-reload during development, add --reload flag manually
+        # but be aware it may cause double-processing if temp files are in project folder
     )
 
