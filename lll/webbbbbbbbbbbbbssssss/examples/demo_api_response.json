@@ -1,0 +1,182 @@
+{
+  "user_id": "user_12345",
+  "timestamp": "2024-01-15T10:30:00Z",
+  "calculation_version": "v1.0",
+  "config_version": "2024-01-15",
+  "final_score": 72.0,
+  "raw_score": 90.0,
+  "confidence_multiplier": 0.8,
+  "confidence_level": "partial_verified",
+  "score_breakdown": {
+    "profession_employment": {
+      "score": 25.0,
+      "max": 30.0,
+      "percentage": 83.33,
+      "details": {
+        "profession_category": {
+          "value": "Engineer",
+          "points": 12
+        },
+        "employment_type": {
+          "value": "Salaried (MNC)",
+          "points": 10
+        },
+        "industry_stability": {
+          "value": "Moderate (IT, Manufacturing)",
+          "points": 3
+        }
+      }
+    },
+    "income_financial": {
+      "score": 20.0,
+      "max": 25.0,
+      "percentage": 80.0,
+      "details": {
+        "income_band": {
+          "value": "15L-25L",
+          "points": 10
+        },
+        "verification_bonus": {
+          "itr_verified": true,
+          "points": 5,
+          "gst_verified": false,
+          "bank_statement_verified": false,
+          "total_bonus": 5
+        }
+      }
+    },
+    "business_experience": {
+      "score": 12.0,
+      "max": 15.0,
+      "percentage": 80.0,
+      "details": {
+        "years_in_business": {
+          "value": "5-10",
+          "points": 12
+        }
+      }
+    },
+    "residence_pin_wealth": {
+      "score": 10.0,
+      "max": 10.0,
+      "percentage": 100.0,
+      "details": {
+        "pin_code": "110016",
+        "wealth_category": "premium",
+        "points": 10
+      }
+    },
+    "social_proof": {
+      "score": 8.0,
+      "max": 10.0,
+      "percentage": 80.0,
+      "details": {
+        "google_rating": {
+          "value": 4.6,
+          "points": 5
+        },
+        "review_count": {
+          "value": 150,
+          "points": 3
+        },
+        "linkedin_presence": {
+          "value": true,
+          "points": 2
+        }
+      }
+    },
+    "assets_lifestyle": {
+      "score": 5.0,
+      "max": 10.0,
+      "percentage": 50.0,
+      "details": {
+        "property_ownership": {
+          "value": "Rents premium",
+          "points": 3
+        },
+        "phone_type": {
+          "value": "Premium smartphone",
+          "points": 2
+        },
+        "vehicle_ownership": {
+          "value": "None",
+          "points": 0
+        }
+      }
+    }
+  },
+  "verification_status": {
+    "pan_verified": true,
+    "itr_verified": true,
+    "gst_verified": false,
+    "bank_statement_verified": false,
+    "degree_verified": false,
+    "verification_date": "2024-01-10"
+  },
+  "input_data": {
+    "declared": {
+      "age_band": "25-35",
+      "profession": "Software Engineer",
+      "employment_type": "Salaried (MNC)",
+      "pin_code": "110016",
+      "phone_type": "Premium smartphone",
+      "years_of_experience": 7,
+      "income_band": "15L-25L"
+    },
+    "verified": {
+      "pan_verified": true,
+      "itr_verified": true
+    },
+    "public_signals": {
+      "google_rating": 4.6,
+      "review_count": 150,
+      "linkedin_presence": true
+    }
+  },
+  "audit_trail": {
+    "calculation_steps": [
+      "Input validation: PASSED",
+      "Profession scoring: Engineer (12) + Salaried MNC (10) + IT Industry (3) = 25/30",
+      "Income scoring: 15L-25L band (10) + ITR verified bonus (5) = 20/25",
+      "Business experience: 5-10 years (12) = 12/15",
+      "Residence: PIN 110016 mapped to premium (10) = 10/10",
+      "Social proof: Google 4.6 (5) + 150 reviews (3) + LinkedIn (2) = 8/10",
+      "Assets: Premium rent (3) + Premium phone (2) = 5/10",
+      "Raw score calculation: 25 + 20 + 12 + 10 + 8 + 5 = 90/100",
+      "Confidence multiplier: Partial verified (PAN + ITR) = 0.8",
+      "Final score: 90 × 0.8 = 72.0"
+    ],
+    "config_files_used": [
+      "weight_buckets.json (v2024-01-15)",
+      "confidence_multipliers.json (v2024-01-15)",
+      "pin_wealth_index.json (v2024-01-15)"
+    ],
+    "calculation_time_ms": 45
+  },
+  "explainability": {
+    "summary": "User scored 72.0/100 based on verified professional profile and financial documents. Strong profession (Engineer at MNC), verified income (15L-25L with ITR), premium residence location, and good social proof. Score reduced by 20% due to partial verification (only PAN + ITR, no GST or bank statements).",
+    "strengths": [
+      "Premium residence location (110016)",
+      "Verified income with ITR",
+      "Strong professional profile (Engineer, MNC)",
+      "Good social proof (4.6 rating, 150 reviews)"
+    ],
+    "improvement_areas": [
+      "Verify GST for additional bonus points",
+      "Verify bank statements for additional bonus",
+      "Property ownership would increase assets score",
+      "Vehicle ownership would add to lifestyle score"
+    ]
+  },
+  "legal_compliance": {
+    "data_sources": [
+      "User-declared information",
+      "Verified documents (PAN, ITR)",
+      "Public web signals (Google ratings, LinkedIn)"
+    ],
+    "no_private_data_used": true,
+    "explainable": true,
+    "audit_logged": true,
+    "bias_mitigation": "Deterministic rules, no ML bias"
+  }
+}

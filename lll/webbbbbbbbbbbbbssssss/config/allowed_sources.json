@@ -1,0 +1,54 @@
+{
+  "allowed_domains": [
+    "tmjhelpline.com",
+    "zentaldental.com",
+    "bodypainshelpline.com",
+
+    "justdial.com",
+    "practo.com",
+    "google.com",
+    "google.co.in",
+
+    "healthgrades.com",
+    "webmd.com",
+
+    "indiadentalassociation.com",
+    "ida.org.in",
+
+    "medium.com",
+    "wordpress.com",
+    "blogspot.com"
+  ],
+
+  "allowed_source_types": [
+    "official_website",
+    "business_listing",
+    "conference_page",
+    "public_article",
+    "public_blog"
+  ],
+
+  "blocked_domains": [
+    "linkedin.com",
+    "facebook.com",
+    "instagram.com",
+    "twitter.com",
+    "x.com",
+    "accounts.google.com",
+    "login.google.com"
+  ],
+
+  "blocked_url_keywords": [
+    "login",
+    "signin",
+    "signup",
+    "auth",
+    "account",
+    "privacy",
+    "terms"
+  ],
+
+  "max_pages_per_profile": 8,
+  "request_timeout_seconds": 10,
+  "user_agent": "PublicProfileBot/1.0 (public-data-only)"
+}

@@ -1,0 +1,8 @@
+{
+  "education": ["BDS", "MDS", "Bachelor", "Master"],
+  "specialization": ["TMJ", "Occlusion", "Cranio"],
+  "role": ["CEO", "Founder", "Director"],
+  "experience": ["years", "experience"],
+  "clinic": ["Clinic", "Dental", "Hospital"]
+}
+ 

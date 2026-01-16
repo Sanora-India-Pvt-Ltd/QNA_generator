@@ -1,0 +1,99 @@
+{
+  "about_table": {
+    "Full Name": "Dr. Sanjay Arora Zental Dental",
+    "Profession": "Delhi Cosmetic Dentistry Doctors In Delhi Cosmetic D",
+    "Location": "Hauz Khas, Delhi",
+    "Company/Clinic": "Not specified",
+    "Experience": "Not specified",
+    "Websites": "Not specified",
+    "Email": "Not specified",
+    "Phone": "Not specified",
+    "Bio": "Sanjay Arora (Zental Dental Clinic) C/o Zental Dental Clinic,  Plot Number 26/1, Behind ADIVA Hospital,  Near Green Park Metro Station Gate No 3,  Yusuf Sarai, Green Park, Delhi-110016 WhatsApp Edit/ suggest business information Mudit Dua (Dental Care) Dr"
+  },
+  "confidence": {
+    "profession": "low",
+    "location": "high",
+    "company": "low",
+    "email": "low",
+    "phone": "low",
+    "website": "low",
+    "experience": "low"
+  },
+  "raw_facts": {
+    "full_name": "Dr. Sanjay Arora Zental Dental",
+    "profession": [
+      {
+        "value": "Delhi Cosmetic Dentistry Doctors In Delhi Cosmetic D",
+        "keyword": "dentist",
+        "evidence": "Delhi Cosmetic Dentistry Doctors In Delhi Cosmetic Dentistry Doctors in",
+        "source_url": "https://www.justdial.com/Delhi/Dr-Mudit-Dua-(Dental-Care)-Above-HDFC-Bank-Hauz-Khas/011PXX11-XX11-170125064914-E6G6_BZDET"
+      },
+      {
+        "value": "Delhi Cosmetic Dentistry Doctors In Delhi Cosmetic Dentistry",
+        "keyword": "doctor",
+        "evidence": "Delhi Cosmetic Dentistry Doctors In Delhi Cosmetic Dentistry Doctors in Hauz Khas",
+        "source_url": "https://www.justdial.com/Delhi/Dr-Mudit-Dua-(Dental-Care)-Above-HDFC-Bank-Hauz-Khas/011PXX11-XX11-170125064914-E6G6_BZDET"
+      },
+      {
+        "value": "uz Khas Dr. Mudit Dua (Dental Care) Dr. Mudit Dua (Dental Care",
+        "keyword": "ca",
+        "evidence": "tistry Doctors in Hauz Khas Dr. Mudit Dua (Dental Care) Dr. Mudit Dua (Dental Care) Cosmetic Dentistry",
+        "source_url": "https://www.justdial.com/Delhi/Dr-Mudit-Dua-(Dental-Care)-Above-HDFC-Bank-Hauz-Khas/011PXX11-XX11-170125064914-E6G6_BZDET"
+      }
+    ],
+    "roles": [],
+    "experience_years": [],
+    "education": [],
+    "companies": [],
+    "locations": [
+      {
+        "value": "Green Park, Delhi",
+        "evidence": ",  Plot Number 26/1, Behind ADIVA Hospital,  Near Green Park Metro Station Gate No 3,  Yusuf Sarai, Green Park, Delhi-110016 WhatsApp Edit/ suggest business information",
+        "source_url": "https://www.justdial.com/Delhi/Dr-Sanjay-Arora-Zental-Dental-Clinic-Behind-Adiva-Hospital-Near-Green-Park-Metro-Station-Gate-No-3-Yusuf-Sarai-Green-Park/011PXX11-XX11-150228151530-K1I3_BZDET"
+      },
+      {
+        "value": "Cosmetic Dentistry Doctors Dentists Be the first one to rate this Claim this business Hauz Khas, Delhi",
+        "evidence": "lhi Cosmetic Dentistry Doctors in Hauz Khas Dr. Mudit Dua (Dental Care) Dr. Mudit Dua (Dental Care) Cosmetic Dentistry Doctors Dentists Be the first one to rate this Claim this business Hauz Khas, Delhi Above HDFC Bank, #A-24, First Floor, Hauz Khas, Delhi-110016 Above HDFC Bank, #A-24, First Floor, H",
+        "source_url": "https://www.justdial.com/Delhi/Dr-Mudit-Dua-(Dental-Care)-Above-HDFC-Bank-Hauz-Khas/011PXX11-XX11-170125064914-E6G6_BZDET"
+      },
+      {
+        "value": "Hauz Khas, Delhi",
+        "evidence": "he first one to rate this Claim this business Hauz Khas, Delhi Above HDFC Bank, #A-24, First Floor, Hauz Khas, Delhi-110016 Above HDFC Bank, #A-24, First Floor, Hauz Khas, Delhi-110016 Dentist BDS (Dentist) Click to",
+        "source_url": "https://www.justdial.com/Delhi/Dr-Mudit-Dua-(Dental-Care)-Above-HDFC-Bank-Hauz-Khas/011PXX11-XX11-170125064914-E6G6_BZDET"
+      },
+      {
+        "value": "Hauz Khas, Delhi",
+        "evidence": "i Above HDFC Bank, #A-24, First Floor, Hauz Khas, Delhi-110016 Above HDFC Bank, #A-24, First Floor, Hauz Khas, Delhi-110016 Dentist BDS (Dentist) Click to Rate Overview Photos Quick Info Photos Similar Doctors View a",
+        "source_url": "https://www.justdial.com/Delhi/Dr-Mudit-Dua-(Dental-Care)-Above-HDFC-Bank-Hauz-Khas/011PXX11-XX11-170125064914-E6G6_BZDET"
+      },
+      {
+        "value": "Hauz Khas, Delhi",
+        "evidence": "Qualification BDS (Dentist) MDS- # Contact Show Number Address Above HDFC Bank, #A-24, First Floor, Hauz Khas, Delhi-110016 Business Hours Missing Add Get info via SMS/Email Share Tap to rate Edit this Listing Claim",
+        "source_url": "https://www.justdial.com/Delhi/Dr-Mudit-Dua-(Dental-Care)-Above-HDFC-Bank-Hauz-Khas/011PXX11-XX11-170125064914-E6G6_BZDET"
+      }
+    ],
+    "specializations": [],
+    "awards": [],
+    "websites": [],
+    "email": [],
+    "phone": [],
+    "address": [],
+    "bio_snippets": [
+      {
+        "value": "Sanjay Arora (Zental Dental Clinic) C/o Zental Dental Clinic,  Plot Number 26/1, Behind ADIVA Hospital,  Near Green Park Metro Station Gate No 3,  Yusuf Sarai, Green Park, Delhi-110016 WhatsApp Edit/ suggest business information",
+        "evidence": "Sanjay Arora (Zental Dental Clinic) C/o Zental Dental Clinic,  Plot Number 26/1, Behind ADIVA Hospital,  Near Green Park Metro Station Gate No 3,  Yusuf Sarai, Green Park, Delhi-110016 WhatsApp Edit/ suggest business information",
+        "source_url": "https://www.justdial.com/Delhi/Dr-Sanjay-Arora-Zental-Dental-Clinic-Behind-Adiva-Hospital-Near-Green-Park-Metro-Station-Gate-No-3-Yusuf-Sarai-Green-Park/011PXX11-XX11-150228151530-K1I3_BZDET"
+      },
+      {
+        "value": "Mudit Dua (Dental Care) Dr",
+        "evidence": "Mudit Dua (Dental Care) Dr",
+        "source_url": "https://www.justdial.com/Delhi/Dr-Mudit-Dua-(Dental-Care)-Above-HDFC-Bank-Hauz-Khas/011PXX11-XX11-170125064914-E6G6_BZDET"
+      }
+    ]
+  },
+  "scraped_urls": [
+    "https://www.justdial.com/Delhi/Dr-Sanjay-Arora-Zental-Dental-Clinic-Behind-Adiva-Hospital-Near-Green-Park-Metro-Station-Gate-No-3-Yusuf-Sarai-Green-Park/011PXX11-XX11-150228151530-K1I3_BZDET",
+    "https://www.justdial.com/Delhi/Dr-Mudit-Dua-(Dental-Care)-Above-HDFC-Bank-Hauz-Khas/011PXX11-XX11-170125064914-E6G6_BZDET"
+  ],
+  "timestamp": "2026-01-16 18:35:37"
+}

@@ -1,0 +1,46 @@
+{
+  "version": "2024-01-15",
+  "description": "Confidence multipliers based on document verification status",
+  "multipliers": {
+    "all_verified": {
+      "value": 1.0,
+      "description": "PAN + ITR verified (or equivalent high-confidence docs)",
+      "requirements": {
+        "pan_verified": true,
+        "itr_verified": true
+      }
+    },
+    "partial_verified": {
+      "value": 0.8,
+      "description": "Only PAN verified, or partial document verification",
+      "requirements": {
+        "pan_verified": true,
+        "itr_verified": false
+      }
+    },
+    "declared_only": {
+      "value": 0.6,
+      "description": "Only declared data, no document verification",
+      "requirements": {
+        "pan_verified": false,
+        "itr_verified": false,
+        "has_declared_data": true
+      }
+    },
+    "no_documents": {
+      "value": 0.4,
+      "description": "Minimal data, no verification possible",
+      "requirements": {
+        "pan_verified": false,
+        "itr_verified": false,
+        "has_declared_data": false
+      }
+    }
+  },
+  "calculation_logic": {
+    "step_1": "Check verification status",
+    "step_2": "Apply highest matching multiplier",
+    "step_3": "Multiply raw score by multiplier",
+    "note": "Multipliers are conservative to prevent fraud and ensure legal compliance"
+  }
+}
